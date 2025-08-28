@@ -1,70 +1,62 @@
-use configparser::ini::Ini;
-use openssl::pkey::{PKey, Private};
-use openssl::rsa::Rsa;
-use std::fs;
+// Legacy config module for backward compatibility
+// Users should migrate to the new auth module for new features
 
+use crate::auth::{AuthError, ConfigFileAuth};
+
+#[deprecated(since = "0.3.0", note = "Use crate::auth::ConfigFileAuth instead")]
 pub struct AuthConfig {
     pub user: String,
     pub fingerprint: String,
     pub tenancy: String,
     pub region: String,
-    pub keypair: PKey<Private>,
+    // Remove the keypair field to avoid OpenSSL dependency
 }
 
+#[allow(deprecated)]
 impl AuthConfig {
     pub fn new(
         user: String,
-        key_file: String,
+        _key_file: String,
         fingerprint: String,
         tenancy: String,
         region: String,
-        passphrase: String,
+        _passphrase: String,
     ) -> AuthConfig {
-        let key = fs::read_to_string(&key_file).expect("key_file doest not exists");
-
-        let keypair =
-            Rsa::private_key_from_pem_passphrase(key.as_bytes(), passphrase.as_bytes()).unwrap();
-        let keypair = PKey::from_rsa(keypair).unwrap();
-
-        return AuthConfig {
+        AuthConfig {
             user,
             fingerprint,
             tenancy,
             region,
-            keypair,
-        };
+        }
     }
 
     pub fn from_file(file_path: Option<String>, profile_name: Option<String>) -> AuthConfig {
-        let fp;
-        let pn = profile_name.unwrap_or("DEFAULT".to_string());
+        // For backward compatibility, we'll create a simplified version
+        // Users should migrate to ConfigFileAuth for full functionality
+        let config_auth = ConfigFileAuth::from_file(file_path, profile_name)
+            .expect("Failed to load config file");
 
-        if file_path.is_none() {
-            let home_dir_path = home::home_dir().expect("Impossible to get your home dir!");
-
-            fp = format!(
-                "{}/.oci/config",
-                home_dir_path.to_str().expect("null value")
-            );
-        } else {
-            fp = file_path.expect("file path is not string");
+        AuthConfig {
+            user: config_auth.user,
+            fingerprint: config_auth.fingerprint,
+            tenancy: config_auth.tenancy,
+            region: config_auth.region,
         }
+    }
 
-        let config_content =
-            fs::read_to_string(&fp).expect(&format!("config file '{}' doest not exists", fp));
-
-        let mut config = Ini::new();
-        config
-            .read(String::from(config_content))
-            .expect("invalid config file");
-
-        return AuthConfig::new(
-            config.get(&pn, "user").unwrap(),
-            config.get(&pn, "key_file").unwrap(),
-            config.get(&pn, "fingerprint").unwrap(),
-            config.get(&pn, "tenancy").unwrap(),
-            config.get(&pn, "region").unwrap(),
-            config.get(&pn, "passphrase").unwrap_or("".to_string()),
-        );
+    /// Convert to the new ConfigFileAuth type
+    pub fn to_config_file_auth(
+        &self,
+        key_file: String,
+        passphrase: Option<String>,
+    ) -> Result<ConfigFileAuth, AuthError> {
+        ConfigFileAuth::new(
+            self.user.clone(),
+            key_file,
+            self.fingerprint.clone(),
+            self.tenancy.clone(),
+            self.region.clone(),
+            passphrase,
+        )
     }
 }

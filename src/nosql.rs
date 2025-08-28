@@ -1,5 +1,7 @@
-use crate::base_client::{encode_body, oci_signer};
+use crate::auth::{AuthError, AuthProvider};
+use crate::base_client::{encode_body, sign_request};
 use crate::config::AuthConfig;
+use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use reqwest::header::HeaderMap;
 use reqwest::Response;
@@ -11,6 +13,14 @@ pub struct QueryDetails {
 }
 
 pub struct Nosql {
+    auth_provider: Arc<dyn AuthProvider>,
+    service_endpoint: String,
+}
+
+// Legacy struct for backward compatibility
+#[deprecated(since = "0.3.0", note = "Use Nosql with AuthProvider instead")]
+#[allow(dead_code)]
+pub struct LegacyNosql {
     config: AuthConfig,
     service_endpoint: String,
 }
@@ -34,35 +44,42 @@ impl Nosql {
     ///## Example 1
     ///```no_run
     ///use oci_sdk::{
-    ///    config::AuthConfig,
+    ///    auth::ConfigFileAuth,
     ///    nosql::{Nosql},
     ///};
+    ///use std::sync::Arc;
     ///
-    ///let auth_config = AuthConfig::from_file(None, None);
-    ///let nosql = Nosql::new(auth_config, None);
+    ///let auth_provider = Arc::new(ConfigFileAuth::from_file(None, None).unwrap());
+    ///let nosql = Nosql::new(auth_provider, None).await.unwrap();
     ///```
     ///
     /// ## Example 2
     ///
-    ///```rust
+    ///```rust,no_run
     ///use oci_sdk::{
-    ///    config::AuthConfig,
+    ///    auth::InstancePrincipalAuth,
     ///    nosql::{Nosql},
     ///};
+    ///use std::sync::Arc;
     ///
-    ///let auth_config = AuthConfig::from_file(Some("tests/assets/oci_config".to_string()), Some("DEFAULT".to_string()));
-    ///let nosql = Nosql::new(auth_config, None);
+    ///let auth_provider = Arc::new(InstancePrincipalAuth::new(None));
+    ///let nosql = Nosql::new(auth_provider, None).await.unwrap();
     ///```
     ///Returns the Nosql client.
-    pub fn new(config: AuthConfig, service_endpoint: Option<String>) -> Nosql {
+    pub async fn new(
+        auth_provider: Arc<dyn AuthProvider>,
+        service_endpoint: Option<String>,
+    ) -> Result<Nosql, AuthError> {
+        let region = auth_provider.get_region().await?;
         let se = service_endpoint.unwrap_or(format!(
             "https://nosql.{}.oci.oraclecloud.com",
-            config.region
+            region
         ));
-        return Nosql {
-            config,
+        
+        Ok(Nosql {
+            auth_provider,
             service_endpoint: se,
-        };
+        })
     }
 
     pub async fn create_table(
@@ -100,13 +117,14 @@ impl Nosql {
 
         let path = format!("/20190828/tables");
 
-        oci_signer(
-            &self.config,
+        sign_request(
+            self.auth_provider.as_ref(),
             &mut headers,
-            String::from("post"),
+            "post",
             &path,
             &self.service_endpoint,
-        );
+        )
+        .await?;
 
         let response = client
             .post(format!("{}{}", self.service_endpoint, path))
@@ -148,13 +166,14 @@ impl Nosql {
 
         let path = format!("/20190828/query?limit={}", limit);
 
-        oci_signer(
-            &self.config,
+        sign_request(
+            self.auth_provider.as_ref(),
             &mut headers,
-            String::from("post"),
+            "post",
             &path,
             &self.service_endpoint,
-        );
+        )
+        .await?;
 
         let response = client
             .post(format!("{}{}", self.service_endpoint, path))
@@ -165,4 +184,22 @@ impl Nosql {
 
         return Ok(response);
     }
+}
+
+// Legacy implementation for backward compatibility
+#[allow(deprecated)]
+impl LegacyNosql {
+    pub fn new(config: AuthConfig, service_endpoint: Option<String>) -> LegacyNosql {
+        let se = service_endpoint.unwrap_or(format!(
+            "https://nosql.{}.oci.oraclecloud.com",
+            config.region
+        ));
+        LegacyNosql {
+            config,
+            service_endpoint: se,
+        }
+    }
+
+    // Note: Legacy methods are not implemented as they require OpenSSL
+    // Users should migrate to the new Nosql struct with AuthProvider
 }

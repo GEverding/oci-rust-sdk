@@ -10,12 +10,26 @@ readme = "README.md"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"]}
 tokio = { version = "1", features = ["full"] }
-openssl = "0.10.41"
-base64 = "0.13.0"
+aws-lc-rs = { version = "1.13.3", features = ["ring-io", "ring-sig-verify"] }
+base64 = "0.22"
 sha2 = "0.10.2"
-serde_json = "1.0.82"
-chrono = "0.4.19"
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
 home = "0.5.3"
 configparser = "3.0.2"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+async-trait = "0.1"
+
+[dev-dependencies]
+gethostname = "0.4"
+
+[[example]]
+name = "comprehensive_example"
+path = "examples/comprehensive_example.rs"
+
+[[example]]
+name = "instance_principal_example"
+path = "examples/instance_principal_example.rs"
