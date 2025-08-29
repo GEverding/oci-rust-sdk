@@ -11,7 +11,7 @@ A modern, cloud-native Oracle Cloud Infrastructure (OCI) SDK for Rust with suppo
 
 - ✅ **Modern Cryptography**: Uses `aws-lc-rs` instead of OpenSSL for better performance and FIPS compliance
 - ✅ **Instance Principal Authentication**: Cloud-native authentication without config files
-- ✅ **Automatic Token Refresh**: Background token refresh for long-running services
+- ✅ **Elegant Token Management**: Automatic refresh with concurrency protection and monitoring
 - ✅ **OCI Queue Support**: Full support for OCI Queue service message publishing
 - ✅ **Async/Await**: Fully asynchronous API using Tokio
 - ✅ **Builder Pattern**: Easy client configuration with builder pattern
@@ -30,13 +30,8 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create Instance Principal auth provider
+    // Token refresh is handled automatically by the built-in TokenManager
     let auth_provider = Arc::new(InstancePrincipalAuth::new(None));
-    
-    // Start background token refresh for long-running services
-    let auth_for_refresh = auth_provider.clone();
-    tokio::spawn(async move {
-        start_token_refresh_task(auth_for_refresh).await;
-    });
 
     // Create Identity client
     let identity = Identity::new(auth_provider.clone(), None).await?;
@@ -140,6 +135,7 @@ allow dynamic-group my-compute-instances to read users in tenancy
 
 - [`comprehensive_example.rs`](./examples/comprehensive_example.rs) - Shows all features including both authentication methods and queue operations
 - [`instance_principal_example.rs`](./examples/instance_principal_example.rs) - Focused example for cloud deployments
+- [`elegant_token_management.rs`](./examples/elegant_token_management.rs) - Demonstrates advanced token management features
 
 Run examples:
 ```bash
@@ -148,6 +144,9 @@ cargo run --example comprehensive_example
 
 # Instance principal example (requires OCI compute instance)
 cargo run --example instance_principal_example
+
+# Token management demonstration
+cargo run --example elegant_token_management
 ```
 
 You can also look at the [test folder](./tests/) for more examples.
@@ -247,11 +246,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Elegant Token Management
+
+The SDK features a sophisticated token management system that handles all the complexity of token lifecycle:
+
+### Key Features
+
+- **Automatic Refresh**: Tokens are refreshed automatically before expiry
+- **Concurrency Protection**: Multiple threads can safely request tokens simultaneously
+- **Smart Caching**: Tokens are cached and reused until they need refreshing
+- **Background Tasks**: Refresh happens in background threads without blocking
+- **Monitoring**: Built-in token status monitoring for debugging
+- **Graceful Shutdown**: Clean resource cleanup when stopping
+
+### Example Usage
+
+```rust
+use oci_sdk::auth::InstancePrincipalAuth;
+use std::sync::Arc;
+
+// Create auth provider - token management is automatic
+let auth = Arc::new(InstancePrincipalAuth::new(None));
+
+// Use across multiple clients - tokens shared efficiently
+let identity = Identity::new(auth.clone(), None).await?;
+let queue = QueueClient::builder().auth_provider(auth.clone()).build().await?;
+
+// Monitor token status for debugging
+if let Some(info) = auth.get_token_info().await {
+    println!("Token expires in: {:?}", info.time_until_expiry);
+}
+
+// Force refresh if needed (usually not necessary)
+auth.refresh_token().await?;
+
+// Clean shutdown (optional - automatic on drop)
+auth.stop().await;
+```
+
+### Benefits Over Manual Token Management
+
+- **No Race Conditions**: Multiple threads can request tokens safely
+- **No Token Expiry**: Automatic refresh prevents authentication failures
+- **No Memory Leaks**: Proper cleanup of background tasks
+- **No Complex Logic**: All token lifecycle handled internally
+- **Better Performance**: Efficient caching and connection reuse
+
 ## What's New in v0.3.0
 
 - 🚀 **Replaced OpenSSL with aws-lc-rs** for better performance and FIPS compliance
 - 🔐 **Instance Principal Authentication** for cloud-native deployments
-- 🔄 **Automatic Token Refresh** for long-running services
+- ✨ **Elegant Token Management** with automatic refresh and concurrency protection
 - 📨 **OCI Queue Service Support** with full message publishing capabilities
 - 🏗️ **Builder Pattern** for easy client configuration
 - ⚡ **Improved Error Handling** with comprehensive error types

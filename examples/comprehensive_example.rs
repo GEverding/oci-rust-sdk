@@ -4,7 +4,7 @@
 // 3. Config file authentication
 // 4. OCI Queue message publishing
 
-use oci_sdk::auth::{ConfigFileAuth, InstancePrincipalAuth, start_token_refresh_task};
+use oci_sdk::auth::{ConfigFileAuth, InstancePrincipalAuth};
 use oci_sdk::identity::Identity;
 use oci_sdk::queue::{QueueClient, QueueMessage};
 use std::sync::Arc;
@@ -91,13 +91,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n2. Instance Principal Authentication Example:");
     
     // Create Instance Principal auth provider
+    // Token refresh is now handled automatically by the built-in TokenManager
     let instance_auth = Arc::new(InstancePrincipalAuth::new(Some("us-ashburn-1".to_string())));
-    
-    // Start the automatic token refresh task in the background
-    let auth_for_refresh = instance_auth.clone();
-    tokio::spawn(async move {
-        start_token_refresh_task(auth_for_refresh).await;
-    });
 
     // Try to create clients with instance principal authentication
     // Note: This will only work when running on an OCI compute instance with proper IAM policies

@@ -25,6 +25,7 @@ async-trait = "0.1"
 
 [dev-dependencies]
 gethostname = "0.4"
+futures = "0.3"
 
 [[example]]
 name = "comprehensive_example"
@@ -33,3 +34,7 @@ path = "examples/comprehensive_example.rs"
 [[example]]
 name = "instance_principal_example"
 path = "examples/instance_principal_example.rs"
+
+[[example]]
+name = "elegant_token_management"
+path = "examples/elegant_token_management.rs"

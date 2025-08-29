@@ -5,7 +5,7 @@ use base64::{engine::general_purpose, Engine as _};
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
@@ -229,7 +229,7 @@ impl AuthProvider for ConfigFileAuth {
 }
 
 pub struct InstancePrincipalAuth {
-    token: Arc<RwLock<Option<InstancePrincipalToken>>>,
+    token_manager: crate::token_manager::InstancePrincipalTokenManager,
     tenancy_id: Arc<RwLock<Option<String>>>,
     region: String,
     metadata_base_url: String,
@@ -239,77 +239,69 @@ impl InstancePrincipalAuth {
     pub fn new(region: Option<String>) -> Self {
         let region = region.unwrap_or_else(|| "us-ashburn-1".to_string());
         
+        // Create token manager with custom config for OCI
+        let config = crate::token_manager::TokenManagerConfig {
+            refresh_buffer: Duration::from_secs(300), // 5 minutes before expiry
+            check_interval: Duration::from_secs(60),  // Check every minute
+            max_waiters: 50,
+            auto_refresh: true,
+        };
+        
+        let token_manager = crate::token_manager::InstancePrincipalTokenManager::new(
+            Some(region.clone()), 
+            Some(config)
+        );
+        
         Self {
-            token: Arc::new(RwLock::new(None)),
+            token_manager,
             tenancy_id: Arc::new(RwLock::new(None)),
             region,
             metadata_base_url: "http://169.254.169.254/opc/v2".to_string(),
         }
     }
 
-    async fn get_metadata_token(&self) -> Result<String, AuthError> {
-        let client = reqwest::Client::new();
-        let response = client
-            .put(&format!("{}/identity/token", self.metadata_base_url))
-            .header("Metadata-Flavor", "Oracle")
-            .header("Authorization", "Bearer Oracle")
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(AuthError::MetadataError(format!(
-                "Failed to get metadata token: {}",
-                response.status()
-            )));
-        }
-
-        response.text().await.map_err(AuthError::from)
-    }
-
-    async fn refresh_token(&self) -> Result<(), AuthError> {
-        let metadata_token = self.get_metadata_token().await?;
-        
-        let client = reqwest::Client::new();
-        let response = client
-            .get(&format!("{}/identity/token", self.metadata_base_url))
-            .header("Metadata-Flavor", "Oracle")
-            .header("Authorization", &format!("Bearer {}", metadata_token))
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(AuthError::MetadataError(format!(
-                "Failed to get instance principal token: {}",
-                response.status()
-            )));
-        }
-
-        let mut token: InstancePrincipalToken = response.json().await?;
-        token.expires_at = UNIX_EPOCH + Duration::from_secs(token.expires_in);
-        
-        *self.token.write().await = Some(token);
-        Ok(())
-    }
-
+    /// Get a valid token, automatically refreshing if needed
     async fn get_valid_token(&self) -> Result<String, AuthError> {
-        {
-            let token_guard = self.token.read().await;
-            if let Some(ref token) = *token_guard {
-                if !token.is_expiring_soon(300) {
-                    // 5 minute buffer
-                    return Ok(token.access_token.clone());
-                }
-            }
-        }
+        self.token_manager
+            .get_token()
+            .await
+            .map_err(|e| match e {
+                crate::token_manager::TokenError::Expired => AuthError::TokenExpired,
+                crate::token_manager::TokenError::MetadataError(msg) => AuthError::MetadataError(msg),
+                crate::token_manager::TokenError::HttpError(e) => AuthError::HttpError(e),
+                crate::token_manager::TokenError::JsonError(e) => AuthError::JsonError(e),
+                crate::token_manager::TokenError::RefreshFailed(msg) => AuthError::MetadataError(msg),
+            })
+    }
 
-        // Token needs refresh
-        self.refresh_token().await?;
+    /// Force refresh the token
+    pub async fn refresh_token(&self) -> Result<(), AuthError> {
+        self.token_manager
+            .refresh_token()
+            .await
+            .map(|_| ())
+            .map_err(|e| match e {
+                crate::token_manager::TokenError::Expired => AuthError::TokenExpired,
+                crate::token_manager::TokenError::MetadataError(msg) => AuthError::MetadataError(msg),
+                crate::token_manager::TokenError::HttpError(e) => AuthError::HttpError(e),
+                crate::token_manager::TokenError::JsonError(e) => AuthError::JsonError(e),
+                crate::token_manager::TokenError::RefreshFailed(msg) => AuthError::MetadataError(msg),
+            })
+    }
 
-        let token_guard = self.token.read().await;
-        token_guard
-            .as_ref()
-            .map(|t| t.access_token.clone())
-            .ok_or(AuthError::TokenExpired)
+    /// Get token information for monitoring/debugging
+    pub async fn get_token_info(&self) -> Option<crate::token_manager::TokenInfo> {
+        self.token_manager.get_token_info().await
+    }
+
+    /// Check if the token manager has a token
+    pub async fn has_token(&self) -> bool {
+        self.token_manager.has_token().await
+    }
+
+    /// Stop the background token refresh (useful for cleanup)
+    pub async fn stop(&self) {
+        self.token_manager.stop().await;
     }
 
     async fn get_tenancy_from_metadata(&self) -> Result<String, AuthError> {
@@ -320,9 +312,24 @@ impl InstancePrincipalAuth {
             }
         }
 
-        let metadata_token = self.get_metadata_token().await?;
-        
+        // Get metadata token for tenancy lookup
         let client = reqwest::Client::new();
+        let metadata_response = client
+            .put(&format!("{}/identity/token", self.metadata_base_url))
+            .header("Metadata-Flavor", "Oracle")
+            .header("Authorization", "Bearer Oracle")
+            .send()
+            .await?;
+
+        if !metadata_response.status().is_success() {
+            return Err(AuthError::MetadataError(format!(
+                "Failed to get metadata token: {}",
+                metadata_response.status()
+            )));
+        }
+
+        let metadata_token = metadata_response.text().await?;
+        
         let response = client
             .get(&format!("{}/identity/tenancy", self.metadata_base_url))
             .header("Metadata-Flavor", "Oracle")
@@ -367,14 +374,5 @@ impl AuthProvider for InstancePrincipalAuth {
     }
 }
 
-/// Async task to refresh instance principal tokens periodically
-pub async fn start_token_refresh_task(auth: Arc<InstancePrincipalAuth>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 minutes
-    
-    loop {
-        interval.tick().await;
-        if let Err(e) = auth.refresh_token().await {
-            eprintln!("Failed to refresh instance principal token: {}", e);
-        }
-    }
-}
+// The start_token_refresh_task function is no longer needed
+// Token refresh is now handled automatically by the TokenManager

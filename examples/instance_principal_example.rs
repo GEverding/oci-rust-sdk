@@ -1,7 +1,7 @@
 // Simple example demonstrating Instance Principal authentication
 // This example shows how to use the SDK in a cloud-native way without config files
 
-use oci_sdk::auth::{InstancePrincipalAuth, start_token_refresh_task};
+use oci_sdk::auth::InstancePrincipalAuth;
 use oci_sdk::identity::Identity;
 use oci_sdk::queue::{QueueClient, QueueMessage};
 use std::sync::Arc;
@@ -13,17 +13,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create Instance Principal auth provider
     // This will automatically detect the region from instance metadata
+    // Token refresh is handled automatically by the built-in TokenManager
     let auth_provider = Arc::new(InstancePrincipalAuth::new(None));
-    
-    // Start the background token refresh task
-    // This ensures tokens are refreshed automatically for long-running services
-    let auth_for_refresh = auth_provider.clone();
-    let _refresh_handle = tokio::spawn(async move {
-        start_token_refresh_task(auth_for_refresh).await;
-    });
 
     println!("✓ Instance Principal authentication configured");
-    println!("✓ Automatic token refresh task started");
+    println!("✓ Automatic token refresh is built-in");
 
     // Create an Identity client to test authentication
     match Identity::new(auth_provider.clone(), None).await {
@@ -61,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "ocid1.queue.oc1.region.example".to_string());
 
     match QueueClient::builder()
-        .auth_provider(auth_provider)
+        .auth_provider(auth_provider.clone())
         .queue_id(&queue_id)
         .build()
         .await
@@ -122,9 +116,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  • Works seamlessly with OCI IAM policies");
 
     // Keep the program running for a bit to demonstrate token refresh
-    println!("\nKeeping program alive for 30 seconds to demonstrate token refresh...");
+    println!("\nDemonstrating token management capabilities...");
+    
+    // Show token information if available
+    if let Some(token_info) = auth_provider.get_token_info().await {
+        println!("Token info:");
+        println!("  - Expires at: {:?}", token_info.expires_at);
+        println!("  - Is expired: {}", token_info.is_expired);
+        println!("  - Is expiring soon: {}", token_info.is_expiring_soon);
+        println!("  - Time until expiry: {:?}", token_info.time_until_expiry);
+    }
+    
+    println!("\nKeeping program alive for 30 seconds to demonstrate automatic token management...");
     tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-    println!("✓ Token refresh working in background");
+    println!("✓ Token management working automatically in background");
 
     Ok(())
 }
