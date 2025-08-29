@@ -118,7 +118,7 @@ impl Default for QueueClientBuilder {
         Self::new()
     }
 }
-
+#[derive(Clone)]
 pub struct QueueClient {
     auth_provider: Arc<dyn AuthProvider>,
     queue_id: String,
