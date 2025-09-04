@@ -18,11 +18,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n1. Config File Authentication Example:");
     if let Ok(config_auth) = ConfigFileAuth::from_file(None, None) {
         let auth_provider = Arc::new(config_auth);
-        
+
         // Create Identity client
         if let Ok(identity_client) = Identity::new(auth_provider.clone(), None).await {
             println!("✓ Identity client created with config file auth");
-            
+
             // Test getting current user
             match identity_client.get_current_user().await {
                 Ok(response) => {
@@ -44,12 +44,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         {
             println!("✓ Queue client created with config file auth");
-            
+
             // Example: Publishing a message
             let messages = vec![
                 QueueMessage {
                     content: "Hello from OCI Rust SDK with aws-lc-rs!".to_string(),
-                    metadata: Some(serde_json::json!({"source": "rust-sdk", "timestamp": chrono::Utc::now()})),
+                    metadata: Some(
+                        serde_json::json!({"source": "rust-sdk", "timestamp": chrono::Utc::now()}),
+                    ),
                 },
                 QueueMessage {
                     content: "Second message".to_string(),
@@ -89,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Example 2: Using Instance Principal Authentication (cloud native method)
     println!("\n2. Instance Principal Authentication Example:");
-    
+
     // Create Instance Principal auth provider
     // Token refresh is now handled automatically by the built-in TokenManager
     let instance_auth = Arc::new(InstancePrincipalAuth::new(Some("us-ashburn-1".to_string())));
@@ -99,11 +101,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Identity::new(instance_auth.clone(), None).await {
         Ok(identity_client) => {
             println!("✓ Identity client created with instance principal auth");
-            
+
             match identity_client.get_current_user().await {
                 Ok(response) => {
                     if response.status().is_success() {
-                        println!("✓ Successfully retrieved current user info via instance principal");
+                        println!(
+                            "✓ Successfully retrieved current user info via instance principal"
+                        );
                     } else {
                         println!("⚠ API call failed: {}", response.status());
                     }
@@ -126,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         Ok(queue_client) => {
             println!("✓ Queue client created with instance principal auth");
-            
+
             // Demonstrate queue operations
             match queue_client.get_stats().await {
                 Ok(response) => {
@@ -140,7 +144,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Err(e) => {
-            println!("⚠ Could not create queue client with instance principal: {}", e);
+            println!(
+                "⚠ Could not create queue client with instance principal: {}",
+                e
+            );
         }
     }
 
@@ -158,7 +165,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   • Replace `AuthConfig::from_file()` with `ConfigFileAuth::from_file()`");
     println!("   • Use `Identity::new(auth_provider, endpoint).await` instead of `Identity::new(config, endpoint)`");
     println!("   • Wrap auth providers in `Arc<>` for sharing between clients");
-    println!("   • For cloud deployments, use `InstancePrincipalAuth::new()` instead of config files");
+    println!(
+        "   • For cloud deployments, use `InstancePrincipalAuth::new()` instead of config files"
+    );
     println!("   • Use `QueueClient::builder()` to create queue clients for message publishing");
 
     println!("\nExample completed!");

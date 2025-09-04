@@ -54,11 +54,9 @@ impl Identity {
         service_endpoint: Option<String>,
     ) -> Result<Identity, AuthError> {
         let region = auth_provider.get_region().await?;
-        let se = service_endpoint.unwrap_or(format!(
-            "https://identity.{}.oci.oraclecloud.com",
-            region
-        ));
-        
+        let se =
+            service_endpoint.unwrap_or(format!("https://identity.{}.oci.oraclecloud.com", region));
+
         Ok(Identity {
             auth_provider,
             service_endpoint: se,

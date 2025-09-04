@@ -33,8 +33,8 @@ impl AuthConfig {
     pub fn from_file(file_path: Option<String>, profile_name: Option<String>) -> AuthConfig {
         // For backward compatibility, we'll create a simplified version
         // Users should migrate to ConfigFileAuth for full functionality
-        let config_auth = ConfigFileAuth::from_file(file_path, profile_name)
-            .expect("Failed to load config file");
+        let config_auth =
+            ConfigFileAuth::from_file(file_path, profile_name).expect("Failed to load config file");
 
         AuthConfig {
             user: config_auth.user,

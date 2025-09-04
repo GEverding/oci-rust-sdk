@@ -18,5 +18,7 @@ pub async fn sign_request(
     path: &str,
     host: &str,
 ) -> Result<(), AuthError> {
-    auth_provider.sign_request(headers, method, path, host).await
+    auth_provider
+        .sign_request(headers, method, path, host)
+        .await
 }

@@ -95,10 +95,10 @@ impl TokenManager {
         Fut: std::future::Future<Output = Result<Token, TokenError>> + Send + 'static,
     {
         let config = config.unwrap_or_default();
-        
+
         // Wrap the async function to return a JoinHandle
         let refresh_fn = Arc::new(move || tokio::spawn(refresh_fn()));
-        
+
         let manager = Self {
             token: Arc::new(RwLock::new(None)),
             refresh_fn,
@@ -134,18 +134,19 @@ impl TokenManager {
     /// Force refresh the token
     pub async fn refresh_token(&self) -> Result<String, TokenError> {
         let _guard = self.refresh_mutex.lock().await;
-        
+
         let handle = (self.refresh_fn)();
-        let new_token = handle.await
+        let new_token = handle
+            .await
             .map_err(|e| TokenError::RefreshFailed(format!("Task join error: {}", e)))?
             .map_err(|e| TokenError::RefreshFailed(e.to_string()))?;
 
         let access_token = new_token.access_token.clone();
         *self.token.write().await = Some(new_token);
-        
+
         // Notify all waiters that token has been refreshed
         self.refresh_notify.notify_waiters();
-        
+
         Ok(access_token)
     }
 
@@ -154,21 +155,22 @@ impl TokenManager {
         if let Ok(_guard) = self.refresh_mutex.try_lock() {
             // We got the mutex, so we're responsible for refreshing
             let handle = (self.refresh_fn)();
-            let new_token = handle.await
+            let new_token = handle
+                .await
                 .map_err(|e| TokenError::RefreshFailed(format!("Task join error: {}", e)))?
                 .map_err(|e| TokenError::RefreshFailed(e.to_string()))?;
 
             let access_token = new_token.access_token.clone();
             *self.token.write().await = Some(new_token);
-            
+
             // Notify all waiters
             self.refresh_notify.notify_waiters();
-            
+
             Ok(access_token)
         } else {
             // Another task is refreshing, wait for it to complete
             self.refresh_notify.notified().await;
-            
+
             // Check if we now have a valid token
             let token_guard = self.token.read().await;
             token_guard
@@ -295,9 +297,7 @@ impl InstancePrincipalTokenManager {
         let refresh_fn = move || {
             let url = metadata_url.clone();
             let client = http_client.clone();
-            async move {
-                Self::fetch_token_from_metadata(&url, &client).await
-            }
+            async move { Self::fetch_token_from_metadata(&url, &client).await }
         };
 
         let token_manager = TokenManager::new(refresh_fn, config);
@@ -313,6 +313,89 @@ impl InstancePrincipalTokenManager {
         metadata_base_url: &str,
         client: &reqwest::Client,
     ) -> Result<Token, TokenError> {
+        // Try the correct OCI instance principal security token endpoint
+        let security_token_response = client
+            .get(&format!("{}/identity/security-token", metadata_base_url))
+            .header("Metadata-Flavor", "Oracle")
+            .header("Authorization", "Bearer Oracle")
+            .send()
+            .await;
+
+        match security_token_response {
+            Ok(resp) if resp.status().is_success() => {
+                let mut token: Token = resp.json().await?;
+                token.issued_at = SystemTime::now();
+                return Ok(token);
+            }
+            Ok(resp) => {
+                // Log the error for debugging
+                let status = resp.status();
+                let error_body = resp.text().await.unwrap_or_default();
+                eprintln!(
+                    "Security token endpoint failed with status {}: {}",
+                    status, error_body
+                );
+
+                // If security-token endpoint fails, try the token endpoint
+                return Self::fetch_token_fallback(metadata_base_url, client).await;
+            }
+            Err(e) => {
+                // Log network error
+                eprintln!("Network error accessing security token endpoint: {}", e);
+
+                // Network error - try fallback
+                return Self::fetch_token_fallback(metadata_base_url, client).await;
+            }
+        }
+    }
+
+    async fn fetch_token_fallback(
+        metadata_base_url: &str,
+        client: &reqwest::Client,
+    ) -> Result<Token, TokenError> {
+        // Try direct approach with token endpoint
+        let response = client
+            .get(&format!("{}/identity/token", metadata_base_url))
+            .header("Metadata-Flavor", "Oracle")
+            .header("Authorization", "Bearer Oracle")
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                let mut token: Token = resp.json().await?;
+                token.issued_at = SystemTime::now();
+                return Ok(token);
+            }
+            Ok(resp) if resp.status() == 405 => {
+                // Method not allowed, try the two-step process
+                eprintln!(
+                    "Token endpoint returned 405 Method Not Allowed, trying two-step process"
+                );
+                return Self::fetch_token_two_step(metadata_base_url, client).await;
+            }
+            Ok(resp) => {
+                // Log error and try the two-step process as fallback
+                let status = resp.status();
+                let error_body = resp.text().await.unwrap_or_default();
+                eprintln!(
+                    "Token endpoint failed with status {}: {}",
+                    status, error_body
+                );
+                return Self::fetch_token_two_step(metadata_base_url, client).await;
+            }
+            Err(e) => {
+                // Log error and try the two-step process as fallback
+                eprintln!("Network error accessing token endpoint: {}", e);
+                return Self::fetch_token_two_step(metadata_base_url, client).await;
+            }
+        }
+    }
+
+    async fn fetch_token_two_step(
+        metadata_base_url: &str,
+        client: &reqwest::Client,
+    ) -> Result<Token, TokenError> {
         // Step 1: Get metadata token
         let metadata_token = Self::get_metadata_token(metadata_base_url, client).await?;
 
@@ -325,9 +408,15 @@ impl InstancePrincipalTokenManager {
             .await?;
 
         if !response.status().is_success() {
+            let status = response.status();
+            let error_body = response.text().await.unwrap_or_default();
+            eprintln!(
+                "Two-step process failed to get instance principal token: {} - {}",
+                status, error_body
+            );
             return Err(TokenError::MetadataError(format!(
-                "Failed to get instance principal token: {}",
-                response.status()
+                "Failed to get instance principal token: {} - {}",
+                status, error_body
             )));
         }
 
@@ -341,21 +430,35 @@ impl InstancePrincipalTokenManager {
         metadata_base_url: &str,
         client: &reqwest::Client,
     ) -> Result<String, TokenError> {
-        let response = client
+        // For OCI IMDSv2, we need to get a session token first using PUT
+        // But if that fails with 405, the endpoint might not support the session token approach
+
+        // Try PUT first (standard IMDSv2 session token approach)
+        let put_response = client
             .put(&format!("{}/identity/token", metadata_base_url))
             .header("Metadata-Flavor", "Oracle")
             .header("Authorization", "Bearer Oracle")
             .send()
-            .await?;
+            .await;
 
-        if !response.status().is_success() {
-            return Err(TokenError::MetadataError(format!(
-                "Failed to get metadata token: {}",
-                response.status()
-            )));
+        match put_response {
+            Ok(resp) if resp.status().is_success() => {
+                return Ok(resp.text().await?);
+            }
+            Ok(resp) if resp.status() == 405 => {
+                // Method not allowed - this endpoint might not support session tokens
+                // Return a dummy token for the direct approach
+                return Ok("Oracle".to_string());
+            }
+            Ok(_resp) => {
+                // Other errors - let's try the direct approach with a dummy token
+                return Ok("Oracle".to_string());
+            }
+            Err(_) => {
+                // Network error - try direct approach
+                return Ok("Oracle".to_string());
+            }
         }
-
-        Ok(response.text().await?)
     }
 
     /// Get a valid token
@@ -458,14 +561,12 @@ mod tests {
         let mut handles = vec![];
         for _ in 0..10 {
             let manager_clone = manager.clone();
-            handles.push(tokio::spawn(async move {
-                manager_clone.get_token().await
-            }));
+            handles.push(tokio::spawn(async move { manager_clone.get_token().await }));
         }
 
         // Wait for all to complete
         let results: Vec<_> = futures::future::join_all(handles).await;
-        
+
         // All should succeed and get the same token
         let tokens: Vec<String> = results.into_iter().map(|r| r.unwrap().unwrap()).collect();
         assert!(tokens.iter().all(|t| t == &tokens[0]));

@@ -113,21 +113,26 @@ impl ConfigFileAuth {
             .map_err(|e| AuthError::InvalidKeyFormat(format!("PKCS8 parse error: {:?}", e)))
     }
 
-    pub fn from_file(file_path: Option<String>, profile_name: Option<String>) -> Result<Self, AuthError> {
+    pub fn from_file(
+        file_path: Option<String>,
+        profile_name: Option<String>,
+    ) -> Result<Self, AuthError> {
         use configparser::ini::Ini;
 
         let fp = if let Some(path) = file_path {
             path
         } else {
-            let home_dir = home::home_dir()
-                .ok_or_else(|| AuthError::KeyLoadError("Cannot determine home directory".to_string()))?;
+            let home_dir = home::home_dir().ok_or_else(|| {
+                AuthError::KeyLoadError("Cannot determine home directory".to_string())
+            })?;
             format!("{}/.oci/config", home_dir.to_string_lossy())
         };
 
         let pn = profile_name.unwrap_or_else(|| "DEFAULT".to_string());
 
-        let config_content = std::fs::read_to_string(&fp)
-            .map_err(|e| AuthError::KeyLoadError(format!("Config file '{}' not found: {}", fp, e)))?;
+        let config_content = std::fs::read_to_string(&fp).map_err(|e| {
+            AuthError::KeyLoadError(format!("Config file '{}' not found: {}", fp, e))
+        })?;
 
         let mut config = Ini::new();
         config
@@ -140,9 +145,9 @@ impl ConfigFileAuth {
         let key_file = config
             .get(&pn, "key_file")
             .ok_or_else(|| AuthError::KeyLoadError("Missing 'key_file' in config".to_string()))?;
-        let fingerprint = config
-            .get(&pn, "fingerprint")
-            .ok_or_else(|| AuthError::KeyLoadError("Missing 'fingerprint' in config".to_string()))?;
+        let fingerprint = config.get(&pn, "fingerprint").ok_or_else(|| {
+            AuthError::KeyLoadError("Missing 'fingerprint' in config".to_string())
+        })?;
         let tenancy = config
             .get(&pn, "tenancy")
             .ok_or_else(|| AuthError::KeyLoadError("Missing 'tenancy' in config".to_string()))?;
@@ -174,29 +179,32 @@ impl AuthProvider for ConfigFileAuth {
 
         let host = host.replace("http://", "").replace("https://", "");
 
-        let mut data = format!("date: {}\n(request-target): {} {}\nhost: {}", date, method, path, host);
+        let mut data = format!(
+            "date: {}\n(request-target): {} {}\nhost: {}",
+            date, method, path, host
+        );
         let mut headers_auth = String::from("date (request-target) host");
 
         if let Some(content_length) = headers.get("content-length") {
-            let content_length_str = content_length
-                .to_str()
-                .map_err(|e| AuthError::SigningError(format!("Invalid content-length header: {}", e)))?;
+            let content_length_str = content_length.to_str().map_err(|e| {
+                AuthError::SigningError(format!("Invalid content-length header: {}", e))
+            })?;
             data = format!("{}\ncontent-length: {}", data, content_length_str);
             headers_auth = format!("{} content-length", headers_auth);
         }
 
         if let Some(content_type) = headers.get("content-type") {
-            let content_type_str = content_type
-                .to_str()
-                .map_err(|e| AuthError::SigningError(format!("Invalid content-type header: {}", e)))?;
+            let content_type_str = content_type.to_str().map_err(|e| {
+                AuthError::SigningError(format!("Invalid content-type header: {}", e))
+            })?;
             data = format!("{}\ncontent-type: {}", data, content_type_str);
             headers_auth = format!("{} content-type", headers_auth);
         }
 
         if let Some(content_sha256) = headers.get("x-content-sha256") {
-            let content_sha256_str = content_sha256
-                .to_str()
-                .map_err(|e| AuthError::SigningError(format!("Invalid x-content-sha256 header: {}", e)))?;
+            let content_sha256_str = content_sha256.to_str().map_err(|e| {
+                AuthError::SigningError(format!("Invalid x-content-sha256 header: {}", e))
+            })?;
             data = format!("{}\nx-content-sha256: {}", data, content_sha256_str);
             headers_auth = format!("{} x-content-sha256", headers_auth);
         }
@@ -238,7 +246,7 @@ pub struct InstancePrincipalAuth {
 impl InstancePrincipalAuth {
     pub fn new(region: Option<String>) -> Self {
         let region = region.unwrap_or_else(|| "us-ashburn-1".to_string());
-        
+
         // Create token manager with custom config for OCI
         let config = crate::token_manager::TokenManagerConfig {
             refresh_buffer: Duration::from_secs(300), // 5 minutes before expiry
@@ -246,12 +254,12 @@ impl InstancePrincipalAuth {
             max_waiters: 50,
             auto_refresh: true,
         };
-        
+
         let token_manager = crate::token_manager::InstancePrincipalTokenManager::new(
-            Some(region.clone()), 
-            Some(config)
+            Some(region.clone()),
+            Some(config),
         );
-        
+
         Self {
             token_manager,
             tenancy_id: Arc::new(RwLock::new(None)),
@@ -262,16 +270,13 @@ impl InstancePrincipalAuth {
 
     /// Get a valid token, automatically refreshing if needed
     async fn get_valid_token(&self) -> Result<String, AuthError> {
-        self.token_manager
-            .get_token()
-            .await
-            .map_err(|e| match e {
-                crate::token_manager::TokenError::Expired => AuthError::TokenExpired,
-                crate::token_manager::TokenError::MetadataError(msg) => AuthError::MetadataError(msg),
-                crate::token_manager::TokenError::HttpError(e) => AuthError::HttpError(e),
-                crate::token_manager::TokenError::JsonError(e) => AuthError::JsonError(e),
-                crate::token_manager::TokenError::RefreshFailed(msg) => AuthError::MetadataError(msg),
-            })
+        self.token_manager.get_token().await.map_err(|e| match e {
+            crate::token_manager::TokenError::Expired => AuthError::TokenExpired,
+            crate::token_manager::TokenError::MetadataError(msg) => AuthError::MetadataError(msg),
+            crate::token_manager::TokenError::HttpError(e) => AuthError::HttpError(e),
+            crate::token_manager::TokenError::JsonError(e) => AuthError::JsonError(e),
+            crate::token_manager::TokenError::RefreshFailed(msg) => AuthError::MetadataError(msg),
+        })
     }
 
     /// Force refresh the token
@@ -282,10 +287,14 @@ impl InstancePrincipalAuth {
             .map(|_| ())
             .map_err(|e| match e {
                 crate::token_manager::TokenError::Expired => AuthError::TokenExpired,
-                crate::token_manager::TokenError::MetadataError(msg) => AuthError::MetadataError(msg),
+                crate::token_manager::TokenError::MetadataError(msg) => {
+                    AuthError::MetadataError(msg)
+                }
                 crate::token_manager::TokenError::HttpError(e) => AuthError::HttpError(e),
                 crate::token_manager::TokenError::JsonError(e) => AuthError::JsonError(e),
-                crate::token_manager::TokenError::RefreshFailed(msg) => AuthError::MetadataError(msg),
+                crate::token_manager::TokenError::RefreshFailed(msg) => {
+                    AuthError::MetadataError(msg)
+                }
             })
     }
 
@@ -329,7 +338,7 @@ impl InstancePrincipalAuth {
         }
 
         let metadata_token = metadata_response.text().await?;
-        
+
         let response = client
             .get(&format!("{}/identity/tenancy", self.metadata_base_url))
             .header("Metadata-Flavor", "Oracle")
@@ -346,7 +355,7 @@ impl InstancePrincipalAuth {
 
         let tenancy_id = response.text().await?;
         *self.tenancy_id.write().await = Some(tenancy_id.clone());
-        
+
         Ok(tenancy_id)
     }
 }
@@ -361,7 +370,10 @@ impl AuthProvider for InstancePrincipalAuth {
         _host: &str,
     ) -> Result<(), AuthError> {
         let token = self.get_valid_token().await?;
-        headers.insert("authorization", format!("Bearer {}", token).parse().unwrap());
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
         Ok(())
     }
 

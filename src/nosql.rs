@@ -1,11 +1,11 @@
 use crate::auth::{AuthError, AuthProvider};
 use crate::base_client::{encode_body, sign_request};
 use crate::config::AuthConfig;
-use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use reqwest::header::HeaderMap;
 use reqwest::Response;
 use serde_json::json;
+use std::sync::Arc;
 
 pub struct QueryDetails {
     pub compartment_id: String,
@@ -71,11 +71,9 @@ impl Nosql {
         service_endpoint: Option<String>,
     ) -> Result<Nosql, AuthError> {
         let region = auth_provider.get_region().await?;
-        let se = service_endpoint.unwrap_or(format!(
-            "https://nosql.{}.oci.oraclecloud.com",
-            region
-        ));
-        
+        let se =
+            service_endpoint.unwrap_or(format!("https://nosql.{}.oci.oraclecloud.com", region));
+
         Ok(Nosql {
             auth_provider,
             service_endpoint: se,

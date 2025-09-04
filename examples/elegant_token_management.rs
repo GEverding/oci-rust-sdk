@@ -20,24 +20,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Demonstrate concurrent access - multiple tasks requesting tokens simultaneously
     println!("\n🔄 Testing concurrent token access...");
-    
+
     let mut handles = vec![];
     for i in 0..5 {
         let auth = auth_provider.clone();
         handles.push(tokio::spawn(async move {
             match Identity::new(auth, None).await {
-                Ok(identity) => {
-                    match identity.get_current_user().await {
-                        Ok(response) => {
-                            println!("  Task {}: ✓ Successfully authenticated (status: {})", i, response.status());
-                            Ok(())
-                        }
-                        Err(e) => {
-                            println!("  Task {}: ⚠ API call failed: {}", i, e);
-                            Err(e)
-                        }
+                Ok(identity) => match identity.get_current_user().await {
+                    Ok(response) => {
+                        println!(
+                            "  Task {}: ✓ Successfully authenticated (status: {})",
+                            i,
+                            response.status()
+                        );
+                        Ok(())
                     }
-                }
+                    Err(e) => {
+                        println!("  Task {}: ⚠ API call failed: {}", i, e);
+                        Err(e)
+                    }
+                },
                 Err(e) => {
                     println!("  Task {}: ⚠ Auth failed: {}", i, e);
                     Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
@@ -49,20 +51,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait for all concurrent tasks to complete
     let results = futures::future::join_all(handles).await;
     let successful = results.iter().filter(|r| r.is_ok()).count();
-    println!("✓ {}/{} concurrent tasks completed successfully", successful, results.len());
+    println!(
+        "✓ {}/{} concurrent tasks completed successfully",
+        successful,
+        results.len()
+    );
 
     // Demonstrate token monitoring
     println!("\n📊 Token Status Monitoring:");
     for i in 0..3 {
         if let Some(token_info) = auth_provider.get_token_info().await {
-            println!("  Check #{}: Token expires in {:?} (expiring soon: {})", 
-                     i + 1, 
-                     token_info.time_until_expiry, 
-                     token_info.is_expiring_soon);
+            println!(
+                "  Check #{}: Token expires in {:?} (expiring soon: {})",
+                i + 1,
+                token_info.time_until_expiry,
+                token_info.is_expiring_soon
+            );
         } else {
             println!("  Check #{}: No token available yet", i + 1);
         }
-        
+
         sleep(Duration::from_secs(2)).await;
     }
 

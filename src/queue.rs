@@ -133,14 +133,14 @@ impl QueueClient {
     }
 
     /// Publish messages to the queue
-    /// 
+    ///
     /// # Example
-    /// 
+    ///
     /// ```rust,no_run
     /// use oci_sdk::auth::ConfigFileAuth;
     /// use oci_sdk::queue::{QueueClient, QueueMessage};
     /// use std::sync::Arc;
-    /// 
+    ///
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ///     let auth = ConfigFileAuth::from_file(None, None)?;
@@ -149,17 +149,17 @@ impl QueueClient {
     ///         .queue_id("ocid1.queue.oc1.region.example")
     ///         .build()
     ///         .await?;
-    /// 
+    ///
     ///     let messages = vec![
     ///         QueueMessage {
     ///             content: "Hello, Queue!".to_string(),
     ///             metadata: None,
     ///         },
     ///     ];
-    /// 
+    ///
     ///     let response = queue_client.put_messages(messages).await?;
     ///     println!("Published messages: {:?}", response);
-    /// 
+    ///
     ///     Ok(())
     /// }
     /// ```
@@ -320,7 +320,10 @@ impl QueueClient {
             now.to_rfc2822().replace("+0000", "GMT").parse().unwrap(),
         );
 
-        let path = format!("/20210201/queues/{}/messages/{}", self.queue_id, message_receipt);
+        let path = format!(
+            "/20210201/queues/{}/messages/{}",
+            self.queue_id, message_receipt
+        );
 
         sign_request(
             self.auth_provider.as_ref(),

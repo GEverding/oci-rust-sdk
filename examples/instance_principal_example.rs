@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Identity::new(auth_provider.clone(), None).await {
         Ok(identity_client) => {
             println!("✓ Identity client created successfully");
-            
+
             // Test the authentication by getting current user info
             match identity_client.get_current_user().await {
                 Ok(response) => {
@@ -44,7 +44,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(e) => {
             println!("⚠ Failed to create Identity client: {}", e);
-            println!("  Make sure this is running on an OCI compute instance with proper IAM policies");
+            println!(
+                "  Make sure this is running on an OCI compute instance with proper IAM policies"
+            );
             return Ok(());
         }
     }
@@ -65,7 +67,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Publish a test message
             let message = QueueMessage {
-                content: format!("Test message from Instance Principal at {}", chrono::Utc::now()),
+                content: format!(
+                    "Test message from Instance Principal at {}",
+                    chrono::Utc::now()
+                ),
                 metadata: Some(serde_json::json!({
                     "source": "instance_principal_example",
                     "hostname": gethostname::gethostname().to_string_lossy()
@@ -117,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Keep the program running for a bit to demonstrate token refresh
     println!("\nDemonstrating token management capabilities...");
-    
+
     // Show token information if available
     if let Some(token_info) = auth_provider.get_token_info().await {
         println!("Token info:");
@@ -126,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  - Is expiring soon: {}", token_info.is_expiring_soon);
         println!("  - Time until expiry: {:?}", token_info.time_until_expiry);
     }
-    
+
     println!("\nKeeping program alive for 30 seconds to demonstrate automatic token management...");
     tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
     println!("✓ Token management working automatically in background");
