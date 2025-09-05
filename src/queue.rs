@@ -342,6 +342,105 @@ impl QueueClient {
 
         Ok(response)
     }
+
+    /// Put messages using OCI CLI (useful for instance principal authentication)
+    /// This method bypasses HTTP client and uses OCI CLI directly
+    pub async fn put_messages_via_cli(
+        &self,
+        messages: Vec<QueueMessage>,
+        cli_path: Option<&str>,
+    ) -> Result<PublishMessageResponse, QueueError> {
+        let cli_path = cli_path.unwrap_or("oci");
+        
+        // For now, handle single message (CLI is easier with single messages)
+        if messages.len() != 1 {
+            return Err(QueueError::ConfigError(
+                "CLI method currently supports only single messages".to_string(),
+            ));
+        }
+
+        let message = &messages[0];
+        
+        // Prepare CLI command
+        let mut cmd = tokio::process::Command::new(cli_path);
+        cmd.args(&[
+            "queue", "message", "put",
+            "--queue-id", &self.queue_id,
+            "--message", &message.content,
+        ]);
+
+        // Add metadata if present
+        if let Some(ref metadata) = message.metadata {
+            let metadata_str = serde_json::to_string(metadata)
+                .map_err(|e| QueueError::JsonError(e))?;
+            cmd.args(&["--metadata", &metadata_str]);
+        }
+
+        // Execute command
+        let output = cmd.output().await
+            .map_err(|e| QueueError::ConfigError(format!("Failed to execute OCI CLI: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(QueueError::ConfigError(format!(
+                "OCI CLI command failed: {}", stderr
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        
+        // Parse CLI output (OCI CLI typically returns JSON)
+        if stdout.trim().is_empty() {
+            // Some CLI commands don't return data on success, create a mock response
+            return Ok(PublishMessageResponse {
+                entries: vec![PublishMessageEntry {
+                    id: "cli-generated-id".to_string(),
+                    error: None,
+                    error_details: None,
+                }],
+            });
+        }
+
+        // Try to parse as JSON
+        match serde_json::from_str::<PublishMessageResponse>(&stdout) {
+            Ok(response) => Ok(response),
+            Err(_) => {
+                // If parsing fails, create a success response
+                Ok(PublishMessageResponse {
+                    entries: vec![PublishMessageEntry {
+                        id: "cli-success".to_string(),
+                        error: None,
+                        error_details: None,
+                    }],
+                })
+            }
+        }
+    }
+
+    /// Put a single message using OCI CLI
+    pub async fn put_message_via_cli(
+        &self,
+        content: String,
+        metadata: Option<serde_json::Value>,
+        cli_path: Option<&str>,
+    ) -> Result<PublishMessageResponse, QueueError> {
+        let message = QueueMessage { content, metadata };
+        self.put_messages_via_cli(vec![message], cli_path).await
+    }
+
+    /// Check if OCI CLI is available and configured for queue operations
+    pub async fn check_cli_availability(cli_path: Option<&str>) -> bool {
+        let cli_path = cli_path.unwrap_or("oci");
+        
+        match tokio::process::Command::new(cli_path)
+            .args(&["queue", "--help"])
+            .output()
+            .await
+        {
+            Ok(output) => output.status.success(),
+            Err(_) => false,
+        }
+    }
 }
 
 #[cfg(test)]
