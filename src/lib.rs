@@ -38,6 +38,7 @@ pub mod config;
 pub mod identity;
 pub mod nosql;
 pub mod queue;
+pub mod secrets;
 
 // Re-export commonly used types
 pub use auth::{AuthError, AuthProvider, ConfigFileAuth, InstancePrincipalAuth, OkeWorkloadIdentityAuth};
