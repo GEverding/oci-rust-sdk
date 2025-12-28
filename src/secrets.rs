@@ -77,9 +77,8 @@ impl SecretsClient {
         service_endpoint: Option<String>,
     ) -> Result<Self, AuthError> {
         let region = auth.get_region().await?;
-        let endpoint = service_endpoint.unwrap_or_else(|| {
-            format!("https://secrets.vaults.{}.oci.oraclecloud.com", region)
-        });
+        let endpoint = service_endpoint
+            .unwrap_or_else(|| format!("https://secrets.vaults.{}.oci.oraclecloud.com", region));
 
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -102,7 +101,12 @@ impl SecretsClient {
         let path = format!("/20180608/secretbundles/{}", secret_id);
 
         let mut headers = HeaderMap::new();
-        headers.insert("date", Self::create_date_header().parse().unwrap());
+        headers.insert(
+            "date",
+            Self::create_date_header()
+                .parse()
+                .map_err(|e| AuthError::ConfigError(format!("Invalid date header: {}", e)))?,
+        );
 
         self.auth
             .sign_request(&mut headers, "get", &path, &self.service_endpoint)
@@ -140,7 +144,12 @@ impl SecretsClient {
         );
 
         let mut headers = HeaderMap::new();
-        headers.insert("date", Self::create_date_header().parse().unwrap());
+        headers.insert(
+            "date",
+            Self::create_date_header()
+                .parse()
+                .map_err(|e| AuthError::ConfigError(format!("Invalid date header: {}", e)))?,
+        );
 
         self.auth
             .sign_request(&mut headers, "get", &path, &self.service_endpoint)

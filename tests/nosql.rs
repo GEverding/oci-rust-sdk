@@ -8,9 +8,10 @@ mod tests {
 
     #[tokio::test]
     async fn nosql() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let auth = Arc::new(
-            ConfigFileAuth::from_file(Some("tests/assets/oci_config".to_string()), None)?
-        );
+        let auth = Arc::new(ConfigFileAuth::from_file(
+            Some("tests/assets/oci_config".to_string()),
+            None,
+        )?);
         let nosql = Nosql::new(auth, Some("http://localhost:12000".to_string())).await?;
 
         let table_limits = TableLimits {

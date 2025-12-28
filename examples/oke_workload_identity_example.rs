@@ -43,10 +43,8 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get configuration from environment
-    let queue_id = std::env::var("OCI_QUEUE_ID")
-        .expect("Set OCI_QUEUE_ID environment variable");
-    let region = std::env::var("OCI_REGION")
-        .expect("Set OCI_REGION environment variable");
+    let queue_id = std::env::var("OCI_QUEUE_ID").expect("Set OCI_QUEUE_ID environment variable");
+    let region = std::env::var("OCI_REGION").expect("Set OCI_REGION environment variable");
 
     // Create OKE Workload Identity authenticator
     // Token path defaults to /var/run/secrets/kubernetes.io/serviceaccount/token

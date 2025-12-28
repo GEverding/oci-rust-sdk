@@ -192,8 +192,9 @@ impl ConfigFileAuth {
 
         let pn = profile_name.unwrap_or_else(|| "DEFAULT".to_string());
 
-        let config_content = std::fs::read_to_string(&fp)
-            .map_err(|e| AuthError::ConfigError(format!("Config file '{}' not found: {}", fp, e)))?;
+        let config_content = std::fs::read_to_string(&fp).map_err(|e| {
+            AuthError::ConfigError(format!("Config file '{}' not found: {}", fp, e))
+        })?;
 
         let mut config = Ini::new();
         config
@@ -220,11 +221,15 @@ impl ConfigFileAuth {
         Self::new(user, key_file, fingerprint, tenancy, region, passphrase)
     }
 
-    fn load_private_key(pem_content: &str, passphrase: Option<&str>) -> Result<RsaKeyPair, AuthError> {
+    fn load_private_key(
+        pem_content: &str,
+        passphrase: Option<&str>,
+    ) -> Result<RsaKeyPair, AuthError> {
         // Handle encrypted keys if passphrase provided
         if passphrase.is_some() && !passphrase.unwrap().is_empty() {
             return Err(AuthError::KeyLoadError(
-                "Encrypted keys not yet supported with aws-lc-rs. Please use an unencrypted key.".to_string()
+                "Encrypted keys not yet supported with aws-lc-rs. Please use an unencrypted key."
+                    .to_string(),
             ));
         }
 
@@ -249,8 +254,14 @@ impl AuthProvider for ConfigFileAuth {
         host: &str,
     ) -> Result<(), AuthError> {
         let key_id = format!("{}/{}/{}", self.tenancy, self.user, self.fingerprint);
-        let authorization = sign_request_with_key(&self.key_pair, &key_id, headers, method, path, host)?;
-        headers.insert("authorization", authorization.parse().unwrap());
+        let authorization =
+            sign_request_with_key(&self.key_pair, &key_id, headers, method, path, host)?;
+        headers.insert(
+            "authorization",
+            authorization.parse().map_err(|e| {
+                AuthError::SigningError(format!("Invalid authorization header: {}", e))
+            })?,
+        );
         Ok(())
     }
 
@@ -268,11 +279,20 @@ impl AuthProvider for ConfigFileAuth {
 // ============================================================================
 
 /// Security token and key material fetched from IMDS
-#[derive(Debug)]
 struct InstanceCredentials {
     security_token: String,
     private_key: RsaKeyPair,
     expires_at: SystemTime,
+}
+
+impl std::fmt::Debug for InstanceCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstanceCredentials")
+            .field("security_token", &"[REDACTED]")
+            .field("private_key", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// Response from the federation endpoint
@@ -419,7 +439,10 @@ impl InstancePrincipalAuth {
 
         // Get the intermediate certificate
         let intermediate_response = client
-            .get(&format!("{}/identity/intermediate.pem", self.metadata_base_url))
+            .get(&format!(
+                "{}/identity/intermediate.pem",
+                self.metadata_base_url
+            ))
             .header("Authorization", "Bearer Oracle")
             .send()
             .await?;
@@ -475,13 +498,34 @@ impl InstancePrincipalAuth {
         let body_str = serde_json::to_string(&body)?;
 
         // We need to sign this request with the instance key
-        let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let date = chrono::Utc::now()
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
 
         let mut headers = HeaderMap::new();
-        headers.insert("date", date.parse().unwrap());
-        headers.insert("content-type", "application/json".parse().unwrap());
-        headers.insert("content-length", body_str.len().to_string().parse().unwrap());
-        headers.insert("x-content-sha256", encode_body(&body_str).parse().unwrap());
+        headers.insert(
+            "date",
+            date.parse()
+                .map_err(|e| AuthError::SigningError(format!("Invalid date header: {}", e)))?,
+        );
+        headers.insert(
+            "content-type",
+            "application/json".parse().map_err(|e| {
+                AuthError::SigningError(format!("Invalid content-type header: {}", e))
+            })?,
+        );
+        headers.insert(
+            "content-length",
+            body_str.len().to_string().parse().map_err(|e| {
+                AuthError::SigningError(format!("Invalid content-length header: {}", e))
+            })?,
+        );
+        headers.insert(
+            "x-content-sha256",
+            encode_body(&body_str).parse().map_err(|e| {
+                AuthError::SigningError(format!("Invalid x-content-sha256 header: {}", e))
+            })?,
+        );
 
         // Parse the federation URL to get host and path
         let url = reqwest::Url::parse(&federation_url)
@@ -495,18 +539,36 @@ impl InstancePrincipalAuth {
         let rng = aws_lc_rs::rand::SystemRandom::new();
 
         // Build signing string
+        let date_header = headers
+            .get("date")
+            .ok_or_else(|| AuthError::SigningError("Missing date header".to_string()))?
+            .to_str()
+            .map_err(|e| AuthError::SigningError(format!("Invalid date header: {}", e)))?;
+        let sha256_header = headers
+            .get("x-content-sha256")
+            .ok_or_else(|| AuthError::SigningError("Missing x-content-sha256 header".to_string()))?
+            .to_str()
+            .map_err(|e| {
+                AuthError::SigningError(format!("Invalid x-content-sha256 header: {}", e))
+            })?;
+
         let signing_string = format!(
             "date: {}\n(request-target): post {}\nhost: {}\ncontent-length: {}\ncontent-type: application/json\nx-content-sha256: {}",
-            headers.get("date").unwrap().to_str().unwrap(),
+            date_header,
             path,
             host,
             body_str.len(),
-            headers.get("x-content-sha256").unwrap().to_str().unwrap()
+            sha256_header
         );
 
         let mut signature = vec![0u8; key_pair.public_modulus_len()];
         key_pair
-            .sign(&RSA_PKCS1_SHA256, &rng, signing_string.as_bytes(), &mut signature)
+            .sign(
+                &RSA_PKCS1_SHA256,
+                &rng,
+                signing_string.as_bytes(),
+                &mut signature,
+            )
             .map_err(|e| AuthError::SigningError(format!("Federation signing failed: {:?}", e)))?;
 
         let b64_signature = BASE64.encode(&signature);
@@ -521,9 +583,9 @@ impl InstancePrincipalAuth {
 
         let response = client
             .post(&federation_url)
-            .header("date", headers.get("date").unwrap().to_str().unwrap())
+            .header("date", date_header)
             .header("content-type", "application/json")
-            .header("x-content-sha256", headers.get("x-content-sha256").unwrap().to_str().unwrap())
+            .header("x-content-sha256", sha256_header)
             .header("authorization", &authorization)
             .body(body_str)
             .send()
@@ -570,7 +632,9 @@ impl InstancePrincipalAuth {
             .map_err(|e| AuthError::InvalidKeyFormat(format!("Key parse error: {:?}", e)))?;
 
         // Exchange for security token
-        let security_token = self.fetch_security_token(&cert, &intermediate_cert, &key_pair).await?;
+        let security_token = self
+            .fetch_security_token(&cert, &intermediate_cert, &key_pair)
+            .await?;
 
         // Security tokens typically expire in 1 hour
         let expires_at = SystemTime::now() + Duration::from_secs(3600);
@@ -627,7 +691,9 @@ impl InstancePrincipalAuth {
         let metadata: InstanceMetadata = response.json().await?;
 
         // tenantId might be in the metadata, or we extract from compartmentId
-        let tenancy = metadata.tenant_id.or(metadata.compartment_id)
+        let tenancy = metadata
+            .tenant_id
+            .or(metadata.compartment_id)
             .ok_or_else(|| AuthError::MetadataError("No tenancy ID in metadata".to_string()))?;
 
         *self.tenancy_id.write().await = Some(tenancy.clone());
@@ -653,16 +719,15 @@ impl AuthProvider for InstancePrincipalAuth {
         // For Instance Principal, the key ID format is: ST$<security_token>
         let key_id = format!("ST${}", creds.security_token);
 
-        let authorization = sign_request_with_key(
-            &creds.private_key,
-            &key_id,
-            headers,
-            method,
-            path,
-            host,
-        )?;
+        let authorization =
+            sign_request_with_key(&creds.private_key, &key_id, headers, method, path, host)?;
 
-        headers.insert("authorization", authorization.parse().unwrap());
+        headers.insert(
+            "authorization",
+            authorization.parse().map_err(|e| {
+                AuthError::SigningError(format!("Invalid authorization header: {}", e))
+            })?,
+        );
         Ok(())
     }
 
@@ -708,8 +773,7 @@ impl OkeWorkloadIdentityAuth {
         "/var/run/secrets/kubernetes.io/serviceaccount/token";
 
     /// OCI-specific token path when using OKE Workload Identity
-    pub const OCI_TOKEN_PATH: &'static str =
-        "/var/run/secrets/oci/token";
+    pub const OCI_TOKEN_PATH: &'static str = "/var/run/secrets/oci/token";
 
     /// Create a new OKE Workload Identity authenticator
     ///
@@ -744,7 +808,10 @@ impl OkeWorkloadIdentityAuth {
     /// Get the RPST endpoint for the region
     fn get_rpst_endpoint(&self) -> String {
         self.rpst_endpoint.clone().unwrap_or_else(|| {
-            format!("https://auth.{}.oraclecloud.com/v1/resourcePrincipalSessionToken", self.region)
+            format!(
+                "https://auth.{}.oraclecloud.com/v1/resourcePrincipalSessionToken",
+                self.region
+            )
         })
     }
 
@@ -798,7 +865,8 @@ impl OkeWorkloadIdentityAuth {
         }
 
         // Decode the payload to get expiry and key info
-        let payload = BASE64.decode(parts[1])
+        let payload = BASE64
+            .decode(parts[1])
             .map_err(|e| AuthError::InvalidKeyFormat(format!("Failed to decode RPST: {}", e)))?;
 
         let claims: serde_json::Value = serde_json::from_slice(&payload)?;
@@ -861,16 +929,15 @@ impl AuthProvider for OkeWorkloadIdentityAuth {
         // For RPST/Workload Identity, key ID is: ST$<rpst_token>
         let key_id = format!("ST${}", creds.security_token);
 
-        let authorization = sign_request_with_key(
-            &creds.private_key,
-            &key_id,
-            headers,
-            method,
-            path,
-            host,
-        )?;
+        let authorization =
+            sign_request_with_key(&creds.private_key, &key_id, headers, method, path, host)?;
 
-        headers.insert("authorization", authorization.parse().unwrap());
+        headers.insert(
+            "authorization",
+            authorization.parse().map_err(|e| {
+                AuthError::SigningError(format!("Invalid authorization header: {}", e))
+            })?,
+        );
         Ok(())
     }
 
@@ -925,10 +992,7 @@ mod tests {
 
     #[test]
     fn test_config_file_auth_missing_file() {
-        let result = ConfigFileAuth::from_file(
-            Some("/nonexistent/path/config".to_string()),
-            None,
-        );
+        let result = ConfigFileAuth::from_file(Some("/nonexistent/path/config".to_string()), None);
         assert!(result.is_err());
     }
 }

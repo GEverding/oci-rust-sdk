@@ -23,6 +23,10 @@ pub enum QueueError {
     ConfigError(String),
     #[error("Queue operation failed: {0}")]
     OperationError(String),
+    #[error("Invalid header value: {0}")]
+    HeaderError(#[from] reqwest::header::ToStrError),
+    #[error("Invalid header parse: {0}")]
+    HeaderParseError(String),
 }
 
 /// A message to be published to a queue
@@ -193,7 +197,10 @@ impl QueueClient {
 
         // Queue service uses a different endpoint pattern
         let endpoint = service_endpoint.unwrap_or_else(|| {
-            format!("https://cell-1.queue.messaging.{}.oci.oraclecloud.com", region)
+            format!(
+                "https://cell-1.queue.messaging.{}.oci.oraclecloud.com",
+                region
+            )
         });
 
         let http_client = reqwest::Client::builder()
@@ -238,7 +245,8 @@ impl QueueClient {
         content: String,
         metadata: Option<serde_json::Value>,
     ) -> Result<PutMessagesResponse, QueueError> {
-        self.put_messages(vec![QueueMessage { content, metadata }]).await
+        self.put_messages(vec![QueueMessage { content, metadata }])
+            .await
     }
 
     /// Put multiple messages to the queue (max 20 per batch)
@@ -269,10 +277,31 @@ impl QueueClient {
         let path = format!("/20210201/queues/{}/messages", self.queue_id);
 
         let mut headers = HeaderMap::new();
-        headers.insert("date", Self::create_date_header().parse().unwrap());
-        headers.insert("content-type", "application/json".parse().unwrap());
-        headers.insert("content-length", body.len().to_string().parse().unwrap());
-        headers.insert("x-content-sha256", encode_body(&body).parse().unwrap());
+        headers.insert(
+            "date",
+            Self::create_date_header()
+                .parse()
+                .map_err(|_| QueueError::HeaderParseError("date header".to_string()))?,
+        );
+        headers.insert(
+            "content-type",
+            "application/json"
+                .parse()
+                .map_err(|_| QueueError::HeaderParseError("content-type header".to_string()))?,
+        );
+        headers.insert(
+            "content-length",
+            body.len()
+                .to_string()
+                .parse()
+                .map_err(|_| QueueError::HeaderParseError("content-length header".to_string()))?,
+        );
+        headers.insert(
+            "x-content-sha256",
+            encode_body(&body)
+                .parse()
+                .map_err(|_| QueueError::HeaderParseError("x-content-sha256 header".to_string()))?,
+        );
 
         self.auth
             .sign_request(&mut headers, "post", &path, &self.service_endpoint)
@@ -321,7 +350,12 @@ impl QueueClient {
         );
 
         let mut headers = HeaderMap::new();
-        headers.insert("date", Self::create_date_header().parse().unwrap());
+        headers.insert(
+            "date",
+            Self::create_date_header()
+                .parse()
+                .map_err(|_| QueueError::HeaderParseError("date header".to_string()))?,
+        );
 
         self.auth
             .sign_request(&mut headers, "get", &path, &self.service_endpoint)
@@ -356,7 +390,12 @@ impl QueueClient {
         );
 
         let mut headers = HeaderMap::new();
-        headers.insert("date", Self::create_date_header().parse().unwrap());
+        headers.insert(
+            "date",
+            Self::create_date_header()
+                .parse()
+                .map_err(|_| QueueError::HeaderParseError("date header".to_string()))?,
+        );
 
         self.auth
             .sign_request(&mut headers, "delete", &path, &self.service_endpoint)
@@ -381,56 +420,6 @@ impl QueueClient {
         Ok(())
     }
 
-    /// Delete multiple messages from the queue
-    pub async fn delete_messages(
-        &self,
-        receipts: Vec<String>,
-    ) -> Result<UpdateMessagesResponse, QueueError> {
-        if receipts.is_empty() {
-            return Err(QueueError::ConfigError("No receipts provided".to_string()));
-        }
-
-        let request = DeleteMessagesRequest {
-            entries: receipts
-                .into_iter()
-                .map(|receipt| DeleteMessageEntry { receipt })
-                .collect(),
-        };
-
-        let body = serde_json::to_string(&request)?;
-        let path = format!("/20210201/queues/{}/messages/actions/deleteMessages", self.queue_id);
-
-        let mut headers = HeaderMap::new();
-        headers.insert("date", Self::create_date_header().parse().unwrap());
-        headers.insert("content-type", "application/json".parse().unwrap());
-        headers.insert("content-length", body.len().to_string().parse().unwrap());
-        headers.insert("x-content-sha256", encode_body(&body).parse().unwrap());
-
-        self.auth
-            .sign_request(&mut headers, "post", &path, &self.service_endpoint)
-            .await?;
-
-        let response = self
-            .http_client
-            .post(format!("{}{}", self.service_endpoint, path))
-            .headers(headers)
-            .body(body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(QueueError::OperationError(format!(
-                "Delete messages failed: {} - {}",
-                status, body
-            )));
-        }
-
-        let result: UpdateMessagesResponse = response.json().await?;
-        Ok(result)
-    }
-
     /// Update message visibility (extend or release the visibility timeout)
     pub async fn update_message(
         &self,
@@ -449,14 +438,31 @@ impl QueueClient {
         );
 
         let mut headers = HeaderMap::new();
-        headers.insert("date", Self::create_date_header().parse().unwrap());
-        headers.insert("content-type", "application/json".parse().unwrap());
-        headers.insert("content-length", body.len().to_string().parse().unwrap());
-        headers.insert("x-content-sha256", encode_body(&body).parse().unwrap());
-
-        self.auth
-            .sign_request(&mut headers, "put", &path, &self.service_endpoint)
-            .await?;
+        headers.insert(
+            "date",
+            Self::create_date_header()
+                .parse()
+                .map_err(|_| QueueError::HeaderParseError("date header".to_string()))?,
+        );
+        headers.insert(
+            "content-type",
+            "application/json"
+                .parse()
+                .map_err(|_| QueueError::HeaderParseError("content-type header".to_string()))?,
+        );
+        headers.insert(
+            "content-length",
+            body.len()
+                .to_string()
+                .parse()
+                .map_err(|_| QueueError::HeaderParseError("content-length header".to_string()))?,
+        );
+        headers.insert(
+            "x-content-sha256",
+            encode_body(&body)
+                .parse()
+                .map_err(|_| QueueError::HeaderParseError("x-content-sha256 header".to_string()))?,
+        );
 
         let response = self
             .http_client
@@ -498,13 +504,37 @@ impl QueueClient {
         };
 
         let body = serde_json::to_string(&request)?;
-        let path = format!("/20210201/queues/{}/messages/actions/updateMessages", self.queue_id);
+        let path = format!(
+            "/20210201/queues/{}/messages/actions/updateMessages",
+            self.queue_id
+        );
 
         let mut headers = HeaderMap::new();
-        headers.insert("date", Self::create_date_header().parse().unwrap());
-        headers.insert("content-type", "application/json".parse().unwrap());
-        headers.insert("content-length", body.len().to_string().parse().unwrap());
-        headers.insert("x-content-sha256", encode_body(&body).parse().unwrap());
+        headers.insert(
+            "date",
+            Self::create_date_header()
+                .parse()
+                .map_err(|_| QueueError::HeaderParseError("date header".to_string()))?,
+        );
+        headers.insert(
+            "content-type",
+            "application/json"
+                .parse()
+                .map_err(|_| QueueError::HeaderParseError("content-type header".to_string()))?,
+        );
+        headers.insert(
+            "content-length",
+            body.len()
+                .to_string()
+                .parse()
+                .map_err(|_| QueueError::HeaderParseError("content-length header".to_string()))?,
+        );
+        headers.insert(
+            "x-content-sha256",
+            encode_body(&body)
+                .parse()
+                .map_err(|_| QueueError::HeaderParseError("x-content-sha256 header".to_string()))?,
+        );
 
         self.auth
             .sign_request(&mut headers, "post", &path, &self.service_endpoint)
@@ -513,8 +543,8 @@ impl QueueClient {
         let response = self
             .http_client
             .post(format!("{}{}", self.service_endpoint, path))
-            .headers(headers)
             .body(body)
+            .headers(headers)
             .send()
             .await?;
 
@@ -536,7 +566,12 @@ impl QueueClient {
         let path = format!("/20210201/queues/{}/stats", self.queue_id);
 
         let mut headers = HeaderMap::new();
-        headers.insert("date", Self::create_date_header().parse().unwrap());
+        headers.insert(
+            "date",
+            Self::create_date_header()
+                .parse()
+                .map_err(|_| QueueError::HeaderParseError("date header".to_string()))?,
+        );
 
         self.auth
             .sign_request(&mut headers, "get", &path, &self.service_endpoint)
@@ -567,7 +602,12 @@ impl QueueClient {
         let path = format!("/20210201/queues/{}/messages{}", self.queue_id, path_params);
 
         let mut headers = HeaderMap::new();
-        headers.insert("date", Self::create_date_header().parse().unwrap());
+        headers.insert(
+            "date",
+            Self::create_date_header()
+                .parse()
+                .map_err(|_| QueueError::HeaderParseError("date header".to_string()))?,
+        );
 
         self.auth
             .sign_request(&mut headers, "get", &path, &self.service_endpoint)

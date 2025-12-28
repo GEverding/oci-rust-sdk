@@ -68,9 +68,8 @@ impl Nosql {
         service_endpoint: Option<String>,
     ) -> Result<Self, AuthError> {
         let region = auth.get_region().await?;
-        let endpoint = service_endpoint.unwrap_or_else(|| {
-            format!("https://nosql.{}.oci.oraclecloud.com", region)
-        });
+        let endpoint = service_endpoint
+            .unwrap_or_else(|| format!("https://nosql.{}.oci.oraclecloud.com", region));
 
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
@@ -97,10 +96,30 @@ impl Nosql {
             .map_err(|e| AuthError::ConfigError(format!("JSON serialization error: {}", e)))?;
 
         let mut headers = HeaderMap::new();
-        headers.insert("date", Self::create_date_header().parse().unwrap());
-        headers.insert("x-content-sha256", encode_body(&body).parse().unwrap());
-        headers.insert("content-length", body.len().to_string().parse().unwrap());
-        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert(
+            "date",
+            Self::create_date_header()
+                .parse()
+                .map_err(|e| AuthError::ConfigError(format!("Invalid date header: {}", e)))?,
+        );
+        headers.insert(
+            "x-content-sha256",
+            encode_body(&body).parse().map_err(|e| {
+                AuthError::ConfigError(format!("Invalid x-content-sha256 header: {}", e))
+            })?,
+        );
+        headers.insert(
+            "content-length",
+            body.len().to_string().parse().map_err(|e| {
+                AuthError::ConfigError(format!("Invalid content-length header: {}", e))
+            })?,
+        );
+        headers.insert(
+            "content-type",
+            "application/json".parse().map_err(|e| {
+                AuthError::ConfigError(format!("Invalid content-type header: {}", e))
+            })?,
+        );
 
         let path = "/20190828/tables";
 
@@ -130,10 +149,30 @@ impl Nosql {
             .map_err(|e| AuthError::ConfigError(format!("JSON serialization error: {}", e)))?;
 
         let mut headers = HeaderMap::new();
-        headers.insert("date", Self::create_date_header().parse().unwrap());
-        headers.insert("x-content-sha256", encode_body(&body).parse().unwrap());
-        headers.insert("content-length", body.len().to_string().parse().unwrap());
-        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert(
+            "date",
+            Self::create_date_header()
+                .parse()
+                .map_err(|e| AuthError::ConfigError(format!("Invalid date header: {}", e)))?,
+        );
+        headers.insert(
+            "x-content-sha256",
+            encode_body(&body).parse().map_err(|e| {
+                AuthError::ConfigError(format!("Invalid x-content-sha256 header: {}", e))
+            })?,
+        );
+        headers.insert(
+            "content-length",
+            body.len().to_string().parse().map_err(|e| {
+                AuthError::ConfigError(format!("Invalid content-length header: {}", e))
+            })?,
+        );
+        headers.insert(
+            "content-type",
+            "application/json".parse().map_err(|e| {
+                AuthError::ConfigError(format!("Invalid content-type header: {}", e))
+            })?,
+        );
 
         let path = format!("/20190828/query?limit={}", limit);
 
@@ -165,7 +204,12 @@ impl Nosql {
         );
 
         let mut headers = HeaderMap::new();
-        headers.insert("date", Self::create_date_header().parse().unwrap());
+        headers.insert(
+            "date",
+            Self::create_date_header()
+                .parse()
+                .map_err(|e| AuthError::ConfigError(format!("Invalid date header: {}", e)))?,
+        );
 
         self.auth
             .sign_request(&mut headers, "get", &path, &self.service_endpoint)
@@ -187,7 +231,12 @@ impl Nosql {
         let path = format!("/20190828/tables?compartmentId={}", compartment_id);
 
         let mut headers = HeaderMap::new();
-        headers.insert("date", Self::create_date_header().parse().unwrap());
+        headers.insert(
+            "date",
+            Self::create_date_header()
+                .parse()
+                .map_err(|e| AuthError::ConfigError(format!("Invalid date header: {}", e)))?,
+        );
 
         self.auth
             .sign_request(&mut headers, "get", &path, &self.service_endpoint)
@@ -216,7 +265,12 @@ impl Nosql {
         );
 
         let mut headers = HeaderMap::new();
-        headers.insert("date", Self::create_date_header().parse().unwrap());
+        headers.insert(
+            "date",
+            Self::create_date_header()
+                .parse()
+                .map_err(|e| AuthError::ConfigError(format!("Invalid date header: {}", e)))?,
+        );
 
         self.auth
             .sign_request(&mut headers, "delete", &path, &self.service_endpoint)

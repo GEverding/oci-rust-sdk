@@ -41,4 +41,6 @@ pub mod queue;
 pub mod secrets;
 
 // Re-export commonly used types
-pub use auth::{AuthError, AuthProvider, ConfigFileAuth, InstancePrincipalAuth, OkeWorkloadIdentityAuth};
+pub use auth::{
+    AuthError, AuthProvider, ConfigFileAuth, InstancePrincipalAuth, OkeWorkloadIdentityAuth,
+};

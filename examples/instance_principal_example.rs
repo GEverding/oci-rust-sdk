@@ -21,8 +21,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get queue ID from environment
-    let queue_id = std::env::var("OCI_QUEUE_ID")
-        .expect("Set OCI_QUEUE_ID environment variable");
+    let queue_id = std::env::var("OCI_QUEUE_ID").expect("Set OCI_QUEUE_ID environment variable");
 
     // Create Instance Principal authenticator
     // Region can be auto-detected from IMDS, or specified explicitly
