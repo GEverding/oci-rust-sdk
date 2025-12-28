@@ -1,14 +1,17 @@
 #[cfg(test)]
 mod tests {
     use oci_sdk::{
-        config::AuthConfig,
+        auth::ConfigFileAuth,
         nosql::{CreateTableDetails, Nosql, QueryDetails, TableLimits},
     };
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn nosql() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let auth_config = AuthConfig::from_file(Some("tests/assets/oci_config".to_string()), None);
-        let nosql = Nosql::new(auth_config, Some("http://localhost:12000".to_string()));
+        let auth = Arc::new(
+            ConfigFileAuth::from_file(Some("tests/assets/oci_config".to_string()), None)?
+        );
+        let nosql = Nosql::new(auth, Some("http://localhost:12000".to_string())).await?;
 
         let table_limits = TableLimits {
             max_read_units: 1,
