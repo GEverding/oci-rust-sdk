@@ -22,10 +22,20 @@ thiserror = "1.0"
 async-trait = "0.1"
 pem = "3.0"
 urlencoding = "2.1"
+clap = { version = "4", features = ["derive"], optional = true }
 
 [dev-dependencies]
 gethostname = "0.4"
 futures = "0.3"
+
+[features]
+default = []
+cli = ["clap"]
+
+[[bin]]
+name = "oci-dataflow"
+path = "src/bin/dataflow.rs"
+required-features = ["cli"]
 
 [[example]]
 name = "instance_principal_example"
