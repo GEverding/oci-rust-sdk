@@ -6,15 +6,18 @@
 //! - `OkeWorkloadIdentityAuth`: Authentication for workloads running in OKE
 
 use async_trait::async_trait;
-use aws_lc_rs::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
+use aws_lc_rs::rsa::KeySize;
+use aws_lc_rs::signature::{KeyPair, RsaKeyPair, RSA_PKCS1_SHA256};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tokio::sync::RwLock;
+use x509_parser::prelude::*;
 
 /// Errors that can occur during authentication
 #[derive(Error, Debug)]
@@ -253,7 +256,7 @@ impl ConfigFileAuth {
         }
 
         // Parse PEM and extract DER bytes
-        let pem = pem::parse(pem_content)
+        let pem = ::pem::parse(pem_content)
             .map_err(|e| AuthError::InvalidKeyFormat(format!("PEM parse error: {}", e)))?;
 
         // Try PKCS8 first, then PKCS1
@@ -300,7 +303,7 @@ impl AuthProvider for ConfigFileAuth {
 /// Security token and key material fetched from IMDS
 struct InstanceCredentials {
     security_token: String,
-    private_key: RsaKeyPair,
+    session_key_pair: RsaKeyPair, // Session key pair for signing API requests
     expires_at: SystemTime,
 }
 
@@ -486,37 +489,39 @@ impl InstancePrincipalAuth {
     }
 
     /// Exchange certificate for security token via federation endpoint
+    /// Returns (security_token, session_key_pair)
     async fn fetch_security_token(
         &self,
         cert: &str,
         intermediate_cert: &str,
-        key_pair: &RsaKeyPair,
-    ) -> Result<String, AuthError> {
+        leaf_key_pair: &RsaKeyPair,
+    ) -> Result<(String, RsaKeyPair), AuthError> {
         let federation_url = self.get_federation_endpoint().await?;
         let client = self.get_http_client().await;
 
-        // Build the certificate chain for the request
-        let mut cert_chain = cert.to_string();
-        if !intermediate_cert.is_empty() {
-            cert_chain.push_str("\n");
-            cert_chain.push_str(intermediate_cert);
-        }
+        // Generate a NEW session key pair for signing subsequent API requests
+        let session_key_pair = Self::generate_session_keypair()?;
+        let session_public_pem = Self::keypair_to_public_pem(&session_key_pair)?;
+
+        // Sanitize PEM strings for base64 encoding
+        let cert_sanitized = Self::sanitize_pem(cert);
+        let session_public_sanitized = Self::sanitize_pem(&session_public_pem);
 
         // Create the X509 federation request body
         let body = serde_json::json!({
-            "certificate": BASE64.encode(cert),
-            "publicKey": BASE64.encode(cert), // The cert contains the public key
+            "certificate": cert_sanitized,
+            "publicKey": session_public_sanitized, // Send SESSION key's public key
             "intermediateCertificates": if intermediate_cert.is_empty() {
                 Vec::<String>::new()
             } else {
-                vec![BASE64.encode(intermediate_cert)]
+                vec![Self::sanitize_pem(intermediate_cert)]
             },
             "purpose": "DEFAULT"
         });
 
         let body_str = serde_json::to_string(&body)?;
 
-        // We need to sign this request with the instance key
+        // Sign this request with the LEAF certificate's private key
         let date = chrono::Utc::now()
             .format("%a, %d %b %Y %H:%M:%S GMT")
             .to_string();
@@ -552,9 +557,11 @@ impl InstancePrincipalAuth {
         let host = url.host_str().unwrap_or("auth.oraclecloud.com");
         let path = url.path();
 
-        // For the federation endpoint, we use a special key ID format with the certificate fingerprint
-        // The key ID for X509 federation is: tenancy/federation/fingerprint
-        // But for initial auth, we use a simpler approach - just sign with the cert
+        // Build keyId: {tenancy_id}/fed-x509/{sha1_fingerprint}
+        let tenancy_id = Self::extract_tenancy_from_cert(cert)?;
+        let cert_fingerprint = Self::compute_cert_fingerprint(cert)?;
+        let key_id = format!("{}/fed-x509/{}", tenancy_id, cert_fingerprint);
+
         let rng = aws_lc_rs::rand::SystemRandom::new();
 
         // Build signing string
@@ -580,8 +587,9 @@ impl InstancePrincipalAuth {
             sha256_header
         );
 
-        let mut signature = vec![0u8; key_pair.public_modulus_len()];
-        key_pair
+        // Sign with the LEAF certificate's private key
+        let mut signature = vec![0u8; leaf_key_pair.public_modulus_len()];
+        leaf_key_pair
             .sign(
                 &RSA_PKCS1_SHA256,
                 &rng,
@@ -592,11 +600,9 @@ impl InstancePrincipalAuth {
 
         let b64_signature = BASE64.encode(&signature);
 
-        // For X509 auth, the key ID is the certificate fingerprint
-        let cert_fingerprint = Self::compute_cert_fingerprint(cert)?;
         let authorization = format!(
             "Signature algorithm=\"rsa-sha256\",headers=\"date (request-target) host content-length content-type x-content-sha256\",keyId=\"{}\",signature=\"{}\",version=\"1\"",
-            cert_fingerprint,
+            key_id,
             b64_signature
         );
 
@@ -620,39 +626,86 @@ impl InstancePrincipalAuth {
         }
 
         let fed_response: FederationResponse = response.json().await?;
-        Ok(fed_response.token)
+        Ok((fed_response.token, session_key_pair))
     }
 
-    /// Compute SHA256 fingerprint of certificate
+    /// Compute SHA1 fingerprint of certificate (OCI uses SHA1, not SHA256)
     fn compute_cert_fingerprint(cert_pem: &str) -> Result<String, AuthError> {
-        let pem = pem::parse(cert_pem)
+        let pem = ::pem::parse(cert_pem)
             .map_err(|e| AuthError::InvalidKeyFormat(format!("Invalid cert PEM: {}", e)))?;
 
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha1::new();
         hasher.update(pem.contents());
         let result = hasher.finalize();
 
-        // Format as colon-separated hex
-        let hex: Vec<String> = result.iter().map(|b| format!("{:02x}", b)).collect();
+        // Format as colon-separated uppercase hex
+        let hex: Vec<String> = result.iter().map(|b| format!("{:02X}", b)).collect();
         Ok(hex.join(":"))
+    }
+
+    /// Extract tenancy OCID from certificate subject
+    fn extract_tenancy_from_cert(cert_pem: &str) -> Result<String, AuthError> {
+        let pem = ::pem::parse(cert_pem)
+            .map_err(|e| AuthError::InvalidKeyFormat(format!("Invalid cert PEM: {}", e)))?;
+
+        let (_, cert) = X509Certificate::from_der(pem.contents())
+            .map_err(|e| AuthError::InvalidKeyFormat(format!("Failed to parse cert: {}", e)))?;
+
+        // Look for tenancy OCID in subject fields
+        for attr in cert.subject().iter_attributes() {
+            if let Ok(value) = attr.as_str() {
+                if value.starts_with("ocid1.tenancy.") {
+                    return Ok(value.to_string());
+                }
+            }
+        }
+
+        Err(AuthError::InvalidKeyFormat(
+            "No tenancy OCID found in certificate subject".to_string(),
+        ))
+    }
+
+    /// Generate a new RSA 2048 session key pair
+    fn generate_session_keypair() -> Result<RsaKeyPair, AuthError> {
+        RsaKeyPair::generate(KeySize::Rsa2048).map_err(|e| {
+            AuthError::KeyLoadError(format!("Failed to generate session key: {:?}", e))
+        })
+    }
+
+    /// Extract public key from RsaKeyPair in PEM format
+    fn keypair_to_public_pem(key_pair: &RsaKeyPair) -> Result<String, AuthError> {
+        let public_key_der = key_pair.public_key().as_ref();
+
+        // Encode as PEM using pem v3.0 API
+        let pem_obj = ::pem::Pem::new("PUBLIC KEY", public_key_der.to_vec());
+        Ok(::pem::encode(&pem_obj))
+    }
+
+    /// Sanitize PEM by removing headers/footers and newlines for base64 encoding
+    fn sanitize_pem(pem_str: &str) -> String {
+        pem_str
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect::<Vec<_>>()
+            .join("")
     }
 
     /// Refresh credentials from IMDS
     async fn refresh_credentials(&self) -> Result<(), AuthError> {
-        // Fetch certificate and key
+        // Fetch certificate and key from IMDS
         let (cert, intermediate_cert, private_key_pem) = self.fetch_certificate_and_key().await?;
 
-        // Parse the private key
-        let pem = pem::parse(&private_key_pem)
+        // Parse the LEAF certificate's private key
+        let pem = ::pem::parse(&private_key_pem)
             .map_err(|e| AuthError::InvalidKeyFormat(format!("Invalid key PEM: {}", e)))?;
 
-        let key_pair = RsaKeyPair::from_pkcs8(pem.contents())
+        let leaf_key_pair = RsaKeyPair::from_pkcs8(pem.contents())
             .or_else(|_| RsaKeyPair::from_der(pem.contents()))
             .map_err(|e| AuthError::InvalidKeyFormat(format!("Key parse error: {:?}", e)))?;
 
-        // Exchange for security token
-        let security_token = self
-            .fetch_security_token(&cert, &intermediate_cert, &key_pair)
+        // Exchange for security token (returns token + session key pair)
+        let (security_token, session_key_pair) = self
+            .fetch_security_token(&cert, &intermediate_cert, &leaf_key_pair)
             .await?;
 
         // Security tokens typically expire in 1 hour
@@ -660,7 +713,7 @@ impl InstancePrincipalAuth {
 
         *self.credentials.write().await = Some(InstanceCredentials {
             security_token,
-            private_key: key_pair,
+            session_key_pair, // Store the session key pair for signing API requests
             expires_at,
         });
 
@@ -738,8 +791,15 @@ impl AuthProvider for InstancePrincipalAuth {
         // For Instance Principal, the key ID format is: ST$<security_token>
         let key_id = format!("ST${}", creds.security_token);
 
-        let authorization =
-            sign_request_with_key(&creds.private_key, &key_id, headers, method, path, host)?;
+        // Sign with the SESSION key pair (not the leaf cert key)
+        let authorization = sign_request_with_key(
+            &creds.session_key_pair,
+            &key_id,
+            headers,
+            method,
+            path,
+            host,
+        )?;
 
         headers.insert(
             "authorization",
@@ -899,7 +959,7 @@ impl OkeWorkloadIdentityAuth {
             .as_str()
             .ok_or_else(|| AuthError::InvalidKeyFormat("No private key in RPST".to_string()))?;
 
-        let pem = pem::parse(private_key_pem)
+        let pem = ::pem::parse(private_key_pem)
             .map_err(|e| AuthError::InvalidKeyFormat(format!("Invalid RPST key: {}", e)))?;
 
         let key_pair = RsaKeyPair::from_pkcs8(pem.contents())
@@ -908,7 +968,7 @@ impl OkeWorkloadIdentityAuth {
 
         Ok(InstanceCredentials {
             security_token: rpst.token,
-            private_key: key_pair,
+            session_key_pair: key_pair, // For RPST, the key in the token IS the session key
             expires_at,
         })
     }
@@ -948,8 +1008,14 @@ impl AuthProvider for OkeWorkloadIdentityAuth {
         // For RPST/Workload Identity, key ID is: ST$<rpst_token>
         let key_id = format!("ST${}", creds.security_token);
 
-        let authorization =
-            sign_request_with_key(&creds.private_key, &key_id, headers, method, path, host)?;
+        let authorization = sign_request_with_key(
+            &creds.session_key_pair,
+            &key_id,
+            headers,
+            method,
+            path,
+            host,
+        )?;
 
         headers.insert(
             "authorization",
