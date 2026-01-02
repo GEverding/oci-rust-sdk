@@ -202,7 +202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_command(client, cli.command).await
         }
         AuthMode::InstancePrincipal => {
-            let auth = InstancePrincipalAuth::new(Some(cli.region.clone()));
+            let auth = InstancePrincipalAuth::new(None);
             let client = DataFlowClient::new(auth, &cli.region);
             run_command(client, cli.command).await
         }
