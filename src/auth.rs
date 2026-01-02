@@ -680,12 +680,64 @@ impl InstancePrincipalAuth {
         })
     }
 
-    /// Extract public key from RsaKeyPair in PEM format
+    /// Extract public key from RsaKeyPair in PEM format (SPKI/X.509 format)
     fn keypair_to_public_pem(key_pair: &RsaKeyPair) -> Result<String, AuthError> {
-        let public_key_der = key_pair.public_key().as_ref();
+        // aws_lc_rs returns PKCS#1 RSAPublicKey format (modulus + exponent)
+        // but OCI expects SubjectPublicKeyInfo (SPKI) format
+        let pkcs1_der = key_pair.public_key().as_ref();
 
-        // Encode as PEM using pem v3.0 API
-        let pem_obj = ::pem::Pem::new("PUBLIC KEY", public_key_der.to_vec());
+        // Wrap PKCS#1 in SPKI structure:
+        // SEQUENCE {
+        //   SEQUENCE {
+        //     OBJECT IDENTIFIER rsaEncryption (1.2.840.113549.1.1.1)
+        //     NULL
+        //   }
+        //   BIT STRING { <pkcs1_der> }
+        // }
+
+        // AlgorithmIdentifier for RSA: SEQUENCE { OID, NULL }
+        // OID 1.2.840.113549.1.1.1 = rsaEncryption
+        let algorithm_identifier: &[u8] = &[
+            0x30, 0x0D, // SEQUENCE, length 13
+            0x06, 0x09, // OBJECT IDENTIFIER, length 9
+            0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01, // 1.2.840.113549.1.1.1
+            0x05, 0x00, // NULL
+        ];
+
+        // BIT STRING wrapper for the public key
+        // BIT STRING tag (0x03) + length + unused bits (0x00) + pkcs1_der
+        let bit_string_len = 1 + pkcs1_der.len(); // 1 byte for unused bits + key data
+        let mut bit_string = Vec::with_capacity(3 + bit_string_len);
+        bit_string.push(0x03); // BIT STRING tag
+
+        // Encode length
+        if bit_string_len < 128 {
+            bit_string.push(bit_string_len as u8);
+        } else {
+            // Long form: 0x82 means "length encoded in next 2 bytes"
+            bit_string.push(0x82);
+            bit_string.push((bit_string_len >> 8) as u8);
+            bit_string.push((bit_string_len & 0xFF) as u8);
+        }
+
+        bit_string.push(0x00); // No unused bits
+        bit_string.extend_from_slice(pkcs1_der);
+
+        // Build the outer SEQUENCE
+        let content_len = algorithm_identifier.len() + bit_string.len();
+        let mut spki_der = Vec::with_capacity(4 + content_len);
+        spki_der.push(0x30); // SEQUENCE tag
+
+        // Encode length (will be > 127, so use long form)
+        spki_der.push(0x82); // Long form, 2 bytes follow
+        spki_der.push((content_len >> 8) as u8);
+        spki_der.push((content_len & 0xFF) as u8);
+
+        spki_der.extend_from_slice(algorithm_identifier);
+        spki_der.extend_from_slice(&bit_string);
+
+        // Encode as PEM
+        let pem_obj = ::pem::Pem::new("PUBLIC KEY", spki_der);
         Ok(::pem::encode(&pem_obj))
     }
 
