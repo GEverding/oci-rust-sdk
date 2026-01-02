@@ -84,7 +84,26 @@ fn sign_request_with_key(
         .to_str()
         .map_err(|e| AuthError::SigningError(format!("Invalid date header: {}", e)))?;
 
-    let host = host.replace("http://", "").replace("https://", "");
+    // Extract just the host portion, handling full URLs or bare hostnames
+    let host = if host.starts_with("http://") || host.starts_with("https://") {
+        // Parse as URL to extract host
+        reqwest::Url::parse(host)
+            .ok()
+            .and_then(|u| {
+                u.host_str().map(|h| {
+                    // Include port if non-standard
+                    if let Some(port) = u.port() {
+                        format!("{}:{}", h, port)
+                    } else {
+                        h.to_string()
+                    }
+                })
+            })
+            .unwrap_or_else(|| host.to_string())
+    } else {
+        // Already just a hostname, use as-is
+        host.to_string()
+    };
 
     // Build signing string
     let mut data = format!(

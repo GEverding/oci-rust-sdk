@@ -144,11 +144,16 @@ impl<A: AuthProvider> DataFlowClient<A> {
         }
     }
 
+    fn service_host(&self) -> String {
+        format!("dataflow.{}.oci.oraclecloud.com", self.region)
+    }
+
+    fn api_version(&self) -> &str {
+        "/20200129"
+    }
+
     fn base_url(&self) -> String {
-        format!(
-            "https://dataflow.{}.oci.oraclecloud.com/20200129",
-            self.region
-        )
+        format!("https://{}{}", self.service_host(), self.api_version())
     }
 
     fn create_date_header() -> String {
@@ -194,9 +199,10 @@ impl<A: AuthProvider> DataFlowClient<A> {
             );
         }
 
-        // Sign the request
+        // Sign the request with full path including API version
+        let full_path = format!("{}{}", self.api_version(), path);
         self.auth
-            .sign_request(&mut headers, method, path, &self.base_url())
+            .sign_request(&mut headers, method, &full_path, &self.base_url())
             .await?;
 
         // Build and send the request
