@@ -35,6 +35,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod dataflow;
 pub mod identity;
 pub mod nosql;
 pub mod queue;
@@ -43,4 +44,8 @@ pub mod secrets;
 // Re-export commonly used types
 pub use auth::{
     AuthError, AuthProvider, ConfigFileAuth, InstancePrincipalAuth, OkeWorkloadIdentityAuth,
+};
+pub use dataflow::{
+    CreateRunDetails, DataFlowClient, DataFlowError, ListRunsParams, Run, RunLifecycleState,
+    RunLogSummary, RunSummary,
 };

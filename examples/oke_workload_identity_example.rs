@@ -7,6 +7,7 @@
 //! - Running in an OKE cluster with Workload Identity enabled
 //! - Service account must be mapped to an OCI IAM principal
 //! - IAM policy must allow queue operations
+//! - KUBERNETES_SERVICE_HOST environment variable set (automatic in K8s)
 //!
 //! # Kubernetes Deployment Example
 //! ```yaml
@@ -15,8 +16,6 @@
 //! metadata:
 //!   name: queue-sender
 //!   namespace: default
-//!   annotations:
-//!     oci.oraclecloud.com/audience: sts.oraclecloud.com
 //! ---
 //! apiVersion: apps/v1
 //! kind: Deployment
@@ -32,7 +31,7 @@
 //!         env:
 //!         - name: OCI_QUEUE_ID
 //!           value: "ocid1.queue.oc1..example"
-//!         - name: OCI_REGION
+//!         - name: OCI_RESOURCE_PRINCIPAL_REGION
 //!           value: "us-ashburn-1"
 //! ```
 
@@ -44,12 +43,10 @@ use std::sync::Arc;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get configuration from environment
     let queue_id = std::env::var("OCI_QUEUE_ID").expect("Set OCI_QUEUE_ID environment variable");
-    let region = std::env::var("OCI_REGION").expect("Set OCI_REGION environment variable");
 
-    // Create OKE Workload Identity authenticator
-    // Token path defaults to /var/run/secrets/kubernetes.io/serviceaccount/token
-    // or /var/run/secrets/oci/token if using OCI-specific token
-    let auth = Arc::new(OkeWorkloadIdentityAuth::new(region, None));
+    // Create OKE Workload Identity authenticator from environment variables
+    // Reads KUBERNETES_SERVICE_HOST and OCI_RESOURCE_PRINCIPAL_REGION
+    let auth = Arc::new(OkeWorkloadIdentityAuth::new()?);
 
     println!("Creating Queue client with OKE Workload Identity auth...");
 
