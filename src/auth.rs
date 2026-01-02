@@ -652,10 +652,18 @@ impl InstancePrincipalAuth {
             .map_err(|e| AuthError::InvalidKeyFormat(format!("Failed to parse cert: {}", e)))?;
 
         // Look for tenancy OCID in subject fields
+        // OCI stores tenancy with prefixes: "opc-tenant:" or "opc-identity:"
         for attr in cert.subject().iter_attributes() {
             if let Ok(value) = attr.as_str() {
+                if let Some(tenancy) = value.strip_prefix("opc-tenant:") {
+                    return Ok(tenancy.trim().to_string());
+                }
+                if let Some(tenancy) = value.strip_prefix("opc-identity:") {
+                    return Ok(tenancy.trim().to_string());
+                }
+                // Fallback: check for direct OCID (legacy behavior)
                 if value.starts_with("ocid1.tenancy.") {
-                    return Ok(value.to_string());
+                    return Ok(value.trim().to_string());
                 }
             }
         }
