@@ -392,6 +392,40 @@ impl InstancePrincipalAuth {
             .unwrap_or_else(|_| reqwest::Client::new())
     }
 
+    /// Map short region codes to full region identifiers
+    fn normalize_region(region: &str) -> String {
+        match region.to_lowercase().as_str() {
+            // North America
+            "iad" => "us-ashburn-1",
+            "phx" => "us-phoenix-1",
+            "sjc" => "us-sanjose-1",
+            "ord" => "us-chicago-1",
+            // EMEA
+            "fra" => "eu-frankfurt-1",
+            "lhr" => "uk-london-1",
+            "ams" => "eu-amsterdam-1",
+            "zrh" => "eu-zurich-1",
+            // APAC
+            "nrt" => "ap-tokyo-1",
+            "kix" => "ap-osaka-1",
+            "icn" => "ap-seoul-1",
+            "syd" => "ap-sydney-1",
+            "mel" => "ap-melbourne-1",
+            "bom" => "ap-mumbai-1",
+            "hyd" => "ap-hyderabad-1",
+            "sin" => "ap-singapore-1",
+            // South America
+            "gru" => "sa-saopaulo-1",
+            "vcp" => "sa-vinhedo-1",
+            // Middle East
+            "jed" => "me-jeddah-1",
+            "dxb" => "me-dubai-1",
+            // If already full name or unknown, return as-is
+            other => return other.to_string(),
+        }
+        .to_string()
+    }
+
     /// Fetch region from IMDS
     async fn fetch_region(&self) -> Result<String, AuthError> {
         // Check cache first
@@ -419,7 +453,7 @@ impl InstancePrincipalAuth {
         }
 
         let region = response.text().await?;
-        let region = region.trim().to_string();
+        let region = Self::normalize_region(region.trim());
 
         *self.region.write().await = Some(region.clone());
         Ok(region)
