@@ -154,6 +154,40 @@ fn sign_request_with_key(
     ))
 }
 
+/// Map short region codes to full region identifiers
+fn normalize_region(region: &str) -> String {
+    match region.to_lowercase().as_str() {
+        // North America
+        "iad" => "us-ashburn-1",
+        "phx" => "us-phoenix-1",
+        "sjc" => "us-sanjose-1",
+        "ord" => "us-chicago-1",
+        // EMEA
+        "fra" => "eu-frankfurt-1",
+        "lhr" => "uk-london-1",
+        "ams" => "eu-amsterdam-1",
+        "zrh" => "eu-zurich-1",
+        // APAC
+        "nrt" => "ap-tokyo-1",
+        "kix" => "ap-osaka-1",
+        "icn" => "ap-seoul-1",
+        "syd" => "ap-sydney-1",
+        "mel" => "ap-melbourne-1",
+        "bom" => "ap-mumbai-1",
+        "hyd" => "ap-hyderabad-1",
+        "sin" => "ap-singapore-1",
+        // South America
+        "gru" => "sa-saopaulo-1",
+        "vcp" => "sa-vinhedo-1",
+        // Middle East
+        "jed" => "me-jeddah-1",
+        "dxb" => "me-dubai-1",
+        // If already full name or unknown, return as-is
+        other => return other.to_string(),
+    }
+    .to_string()
+}
+
 // ============================================================================
 // Config File Authentication (API Key)
 // ============================================================================
@@ -392,40 +426,6 @@ impl InstancePrincipalAuth {
             .unwrap_or_else(|_| reqwest::Client::new())
     }
 
-    /// Map short region codes to full region identifiers
-    fn normalize_region(region: &str) -> String {
-        match region.to_lowercase().as_str() {
-            // North America
-            "iad" => "us-ashburn-1",
-            "phx" => "us-phoenix-1",
-            "sjc" => "us-sanjose-1",
-            "ord" => "us-chicago-1",
-            // EMEA
-            "fra" => "eu-frankfurt-1",
-            "lhr" => "uk-london-1",
-            "ams" => "eu-amsterdam-1",
-            "zrh" => "eu-zurich-1",
-            // APAC
-            "nrt" => "ap-tokyo-1",
-            "kix" => "ap-osaka-1",
-            "icn" => "ap-seoul-1",
-            "syd" => "ap-sydney-1",
-            "mel" => "ap-melbourne-1",
-            "bom" => "ap-mumbai-1",
-            "hyd" => "ap-hyderabad-1",
-            "sin" => "ap-singapore-1",
-            // South America
-            "gru" => "sa-saopaulo-1",
-            "vcp" => "sa-vinhedo-1",
-            // Middle East
-            "jed" => "me-jeddah-1",
-            "dxb" => "me-dubai-1",
-            // If already full name or unknown, return as-is
-            other => return other.to_string(),
-        }
-        .to_string()
-    }
-
     /// Fetch region from IMDS
     async fn fetch_region(&self) -> Result<String, AuthError> {
         // Check cache first
@@ -453,7 +453,7 @@ impl InstancePrincipalAuth {
         }
 
         let region = response.text().await?;
-        let region = Self::normalize_region(region.trim());
+        let region = normalize_region(region.trim());
 
         *self.region.write().await = Some(region.clone());
         Ok(region)
@@ -917,103 +917,155 @@ impl AuthProvider for InstancePrincipalAuth {
 // OKE Workload Identity Authentication
 // ============================================================================
 
-/// Token response from RPST endpoint
+/// Token response from proxymux endpoint
 #[derive(Debug, Deserialize)]
-struct RpstResponse {
+struct ProxymuxResponse {
     token: String,
 }
 
 /// Authentication for workloads running in Oracle Kubernetes Engine (OKE)
 ///
-/// This uses the projected service account token mounted in the pod to
-/// authenticate with OCI services.
+/// Uses the in-cluster proxymux service to exchange K8s service account tokens
+/// for OCI resource principal session tokens.
 ///
 /// # Prerequisites
-/// - Workload must be running in an OKE cluster with Workload Identity enabled
-/// - Service account must be mapped to an OCI IAM policy
-/// - Token must be mounted at the expected path
+/// - Running in OKE cluster with Workload Identity enabled
+/// - KUBERNETES_SERVICE_HOST environment variable set
+/// - Service account token mounted at /var/run/secrets/kubernetes.io/serviceaccount/token
+/// - CA cert mounted at /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
 pub struct OkeWorkloadIdentityAuth {
     credentials: Arc<RwLock<Option<InstanceCredentials>>>,
-    region: String,
-    token_path: String,
-    rpst_endpoint: Option<String>,
-    refresh_buffer_secs: u64,
+    region: Option<String>,
+    service_host: String,
+    service_port: u16,
+    sa_token_path: String,
+    #[allow(dead_code)] // Used during build to configure http_client
+    sa_cert_path: String,
+    http_client: reqwest::Client,
+    imds_client: reqwest::Client,
 }
 
 impl OkeWorkloadIdentityAuth {
-    /// Default path for the projected service account token
-    pub const DEFAULT_TOKEN_PATH: &'static str =
+    const DEFAULT_SA_TOKEN_PATH: &'static str =
         "/var/run/secrets/kubernetes.io/serviceaccount/token";
+    const DEFAULT_SA_CERT_PATH: &'static str =
+        "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+    const PROXYMUX_PORT: u16 = 12250;
+    const PROXYMUX_PATH: &'static str = "/resourcePrincipalSessionTokens";
+    const IMDS_BASE_URL: &'static str = "http://169.254.169.254/opc/v2";
 
-    /// OCI-specific token path when using OKE Workload Identity
-    pub const OCI_TOKEN_PATH: &'static str = "/var/run/secrets/oci/token";
+    /// Create from environment variables
+    pub fn new() -> Result<Self, AuthError> {
+        Self::builder().build()
+    }
 
-    /// Create a new OKE Workload Identity authenticator
-    ///
-    /// # Arguments
-    /// * `region` - The OCI region
-    /// * `token_path` - Optional custom path to the service account token
-    pub fn new(region: String, token_path: Option<String>) -> Self {
-        let token_path = token_path.unwrap_or_else(|| {
-            // Try OCI-specific path first, fall back to default K8s path
-            if std::path::Path::new(Self::OCI_TOKEN_PATH).exists() {
-                Self::OCI_TOKEN_PATH.to_string()
+    /// Builder for explicit configuration
+    pub fn builder() -> OkeWorkloadIdentityAuthBuilder {
+        OkeWorkloadIdentityAuthBuilder::default()
+    }
+
+    /// Sanitize public key PEM - remove headers/footers and newlines
+    fn sanitize_public_key(pem: &str) -> String {
+        pem.lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// Generate RSA 2048 session keypair
+    fn generate_session_keypair() -> Result<RsaKeyPair, AuthError> {
+        RsaKeyPair::generate(KeySize::Rsa2048).map_err(|e| {
+            AuthError::InvalidKeyFormat(format!("Failed to generate keypair: {:?}", e))
+        })
+    }
+
+    /// Extract public key from keypair as PEM (SPKI format)
+    fn extract_public_key_pem(key_pair: &RsaKeyPair) -> Result<String, AuthError> {
+        let pkcs1_der = key_pair.public_key().as_ref();
+
+        // Wrap PKCS#1 in SPKI structure
+        let spki_der = {
+            let mut spki = Vec::new();
+
+            // SEQUENCE tag + length placeholder
+            spki.push(0x30);
+            let len_pos = spki.len();
+            spki.push(0x00); // placeholder
+
+            // AlgorithmIdentifier SEQUENCE
+            spki.extend_from_slice(&[
+                0x30, 0x0d, // SEQUENCE, length 13
+                0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01,
+                0x01, // OID rsaEncryption
+                0x05, 0x00, // NULL
+            ]);
+
+            // BIT STRING containing PKCS#1 public key
+            spki.push(0x03); // BIT STRING tag
+            let bit_string_len = pkcs1_der.len() + 1;
+            if bit_string_len < 128 {
+                spki.push(bit_string_len as u8);
             } else {
-                Self::DEFAULT_TOKEN_PATH.to_string()
+                spki.push(0x82);
+                spki.push((bit_string_len >> 8) as u8);
+                spki.push((bit_string_len & 0xff) as u8);
             }
+            spki.push(0x00); // no unused bits
+            spki.extend_from_slice(pkcs1_der);
+
+            // Fix outer SEQUENCE length
+            let total_len = spki.len() - 2;
+            if total_len < 128 {
+                spki[len_pos] = total_len as u8;
+            } else {
+                spki.insert(len_pos, 0x82);
+                spki.insert(len_pos + 1, (total_len >> 8) as u8);
+                spki.insert(len_pos + 2, (total_len & 0xff) as u8);
+            }
+
+            spki
+        };
+
+        let pem = ::pem::Pem::new("PUBLIC KEY", spki_der);
+        Ok(::pem::encode(&pem))
+    }
+
+    /// Read K8s service account token
+    fn read_sa_token(&self) -> Result<String, AuthError> {
+        std::fs::read_to_string(&self.sa_token_path)
+            .map(|s| s.trim().to_string())
+            .map_err(|e| {
+                AuthError::ConfigError(format!(
+                    "Failed to read K8s SA token at {}: {}",
+                    self.sa_token_path, e
+                ))
+            })
+    }
+
+    /// Fetch resource principal session token from proxymux
+    async fn fetch_session_token(&self) -> Result<InstanceCredentials, AuthError> {
+        let sa_token = self.read_sa_token()?;
+        let session_key_pair = Self::generate_session_keypair()?;
+        let public_key_pem = Self::extract_public_key_pem(&session_key_pair)?;
+        let sanitized_key = Self::sanitize_public_key(&public_key_pem);
+
+        let url = format!(
+            "https://{}:{}{}",
+            self.service_host,
+            self.service_port,
+            Self::PROXYMUX_PATH
+        );
+
+        let body = serde_json::json!({
+            "podKey": sanitized_key
         });
 
-        Self {
-            credentials: Arc::new(RwLock::new(None)),
-            region,
-            token_path,
-            rpst_endpoint: None,
-            refresh_buffer_secs: 300,
-        }
-    }
-
-    /// Set a custom RPST endpoint (for testing)
-    pub fn with_rpst_endpoint(mut self, endpoint: String) -> Self {
-        self.rpst_endpoint = Some(endpoint);
-        self
-    }
-
-    /// Get the RPST endpoint for the region
-    fn get_rpst_endpoint(&self) -> String {
-        self.rpst_endpoint.clone().unwrap_or_else(|| {
-            format!(
-                "https://auth.{}.oraclecloud.com/v1/resourcePrincipalSessionToken",
-                self.region
-            )
-        })
-    }
-
-    /// Read the Kubernetes service account token
-    fn read_k8s_token(&self) -> Result<String, AuthError> {
-        std::fs::read_to_string(&self.token_path).map_err(|e| {
-            AuthError::ConfigError(format!(
-                "Failed to read K8s token at {}: {}. \
-                 Ensure workload identity is configured and token is mounted.",
-                self.token_path, e
-            ))
-        })
-    }
-
-    /// Exchange K8s token for OCI RPST credentials
-    async fn fetch_rpst_credentials(&self) -> Result<InstanceCredentials, AuthError> {
-        let k8s_token = self.read_k8s_token()?;
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-
-        let rpst_url = self.get_rpst_endpoint();
-
-        // Exchange the K8s token for RPST
-        let response = client
-            .post(&rpst_url)
-            .header("Authorization", format!("Bearer {}", k8s_token))
+        let response = self
+            .http_client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", sa_token))
             .header("Content-Type", "application/json")
+            .json(&body)
             .send()
             .await?;
 
@@ -1021,67 +1073,86 @@ impl OkeWorkloadIdentityAuth {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(AuthError::MetadataError(format!(
-                "RPST token exchange failed: {} - {}",
+                "Proxymux request failed: {} - {}",
                 status, body
             )));
         }
 
-        let rpst: RpstResponse = response.json().await?;
+        // Response is base64-encoded JSON
+        let response_text = response.text().await?;
+        let decoded = BASE64.decode(response_text.as_bytes()).map_err(|e| {
+            AuthError::InvalidKeyFormat(format!("Failed to decode response: {}", e))
+        })?;
 
-        // The RPST contains a JWT with embedded key material
-        // For now, we'll parse the essential parts
-        let parts: Vec<&str> = rpst.token.split('.').collect();
+        let proxymux_response: ProxymuxResponse = serde_json::from_slice(&decoded)?;
+
+        // Parse JWT to get expiry
+        let parts: Vec<&str> = proxymux_response.token.split('.').collect();
         if parts.len() != 3 {
             return Err(AuthError::InvalidKeyFormat(
-                "Invalid RPST token format".to_string(),
+                "Invalid JWT format".to_string(),
             ));
         }
 
-        // Decode the payload to get expiry and key info
         let payload = BASE64
             .decode(parts[1])
-            .map_err(|e| AuthError::InvalidKeyFormat(format!("Failed to decode RPST: {}", e)))?;
+            .map_err(|e| AuthError::InvalidKeyFormat(format!("Failed to decode JWT: {}", e)))?;
 
         let claims: serde_json::Value = serde_json::from_slice(&payload)?;
+        let exp = claims["exp"]
+            .as_u64()
+            .ok_or_else(|| AuthError::InvalidKeyFormat("No exp claim in token".to_string()))?;
 
-        // Get expiry from claims
-        let exp = claims["exp"].as_u64().unwrap_or(3600);
         let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(exp);
 
-        // The RPST includes a private key claim for signing
-        let private_key_pem = claims["pkey"]
-            .as_str()
-            .ok_or_else(|| AuthError::InvalidKeyFormat("No private key in RPST".to_string()))?;
-
-        let pem = ::pem::parse(private_key_pem)
-            .map_err(|e| AuthError::InvalidKeyFormat(format!("Invalid RPST key: {}", e)))?;
-
-        let key_pair = RsaKeyPair::from_pkcs8(pem.contents())
-            .or_else(|_| RsaKeyPair::from_der(pem.contents()))
-            .map_err(|e| AuthError::InvalidKeyFormat(format!("RPST key parse error: {:?}", e)))?;
-
         Ok(InstanceCredentials {
-            security_token: rpst.token,
-            session_key_pair: key_pair, // For RPST, the key in the token IS the session key
+            security_token: proxymux_response.token,
+            session_key_pair,
             expires_at,
         })
     }
 
-    /// Get valid credentials, refreshing if needed
+    /// Get valid credentials, refreshing at half-life
     async fn get_credentials(&self) -> Result<(), AuthError> {
         {
             let guard = self.credentials.read().await;
             if let Some(ref creds) = *guard {
-                let buffer = Duration::from_secs(self.refresh_buffer_secs);
-                if creds.expires_at > SystemTime::now() + buffer {
-                    return Ok(());
+                // Refresh at half-life: check if we're past the halfway point to expiry
+                let now = SystemTime::now();
+                if let Ok(time_until_expiry) = creds.expires_at.duration_since(now) {
+                    // Token is still valid, check if we're in the first half of its lifetime
+                    // We need to know when it was issued to calculate half-life
+                    // For simplicity, assume tokens are valid for 1 hour and refresh at 30 min remaining
+                    if time_until_expiry > Duration::from_secs(1800) {
+                        return Ok(());
+                    }
                 }
             }
         }
 
-        let creds = self.fetch_rpst_credentials().await?;
+        let creds = self.fetch_session_token().await?;
         *self.credentials.write().await = Some(creds);
         Ok(())
+    }
+
+    /// Fetch region from Instance Metadata Service
+    async fn fetch_region_from_imds(&self) -> Result<String, AuthError> {
+        let response = self
+            .imds_client
+            .get(format!("{}/instance/region", Self::IMDS_BASE_URL))
+            .header("Authorization", "Bearer Oracle")
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(AuthError::MetadataError(format!(
+                "Failed to get region from IMDS: {}",
+                response.status()
+            )));
+        }
+
+        let region = response.text().await?;
+        Ok(normalize_region(region.trim()))
     }
 }
 
@@ -1099,8 +1170,12 @@ impl AuthProvider for OkeWorkloadIdentityAuth {
         let guard = self.credentials.read().await;
         let creds = guard.as_ref().ok_or(AuthError::TokenExpired)?;
 
-        // For RPST/Workload Identity, key ID is: ST$<rpst_token>
-        let key_id = format!("ST${}", creds.security_token);
+        // Key ID is ST${token} (full token including ST$ prefix if present)
+        let key_id = if creds.security_token.starts_with("ST$") {
+            creds.security_token.clone()
+        } else {
+            format!("ST${}", creds.security_token)
+        };
 
         let authorization = sign_request_with_key(
             &creds.session_key_pair,
@@ -1121,13 +1196,12 @@ impl AuthProvider for OkeWorkloadIdentityAuth {
     }
 
     async fn get_tenancy_id(&self) -> Result<String, AuthError> {
-        // For workload identity, we need to parse tenancy from the RPST claims
         self.get_credentials().await?;
 
         let guard = self.credentials.read().await;
         let creds = guard.as_ref().ok_or(AuthError::TokenExpired)?;
 
-        // Parse the token to get tenancy
+        // Parse JWT to get tenancy
         let parts: Vec<&str> = creds.security_token.split('.').collect();
         if parts.len() >= 2 {
             if let Ok(payload) = BASE64.decode(parts[1]) {
@@ -1140,12 +1214,128 @@ impl AuthProvider for OkeWorkloadIdentityAuth {
         }
 
         Err(AuthError::MetadataError(
-            "Could not extract tenancy from RPST token".to_string(),
+            "Could not extract tenancy from token".to_string(),
         ))
     }
 
     async fn get_region(&self) -> Result<String, AuthError> {
-        Ok(self.region.clone())
+        // 1. Explicit region config
+        if let Some(ref region) = self.region {
+            return Ok(region.clone());
+        }
+
+        // 2. Try to extract from token claims
+        if let Ok(()) = self.get_credentials().await {
+            let guard = self.credentials.read().await;
+            if let Some(ref creds) = *guard {
+                let parts: Vec<&str> = creds.security_token.split('.').collect();
+                if parts.len() >= 2 {
+                    if let Ok(payload) = BASE64.decode(parts[1]) {
+                        if let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&payload) {
+                            if let Some(region) = claims["region"].as_str() {
+                                return Ok(region.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Auto-detect from IMDS
+        self.fetch_region_from_imds().await
+    }
+}
+
+/// Builder for OkeWorkloadIdentityAuth
+#[derive(Default)]
+pub struct OkeWorkloadIdentityAuthBuilder {
+    service_host: Option<String>,
+    service_port: Option<u16>,
+    region: Option<String>,
+    sa_token_path: Option<String>,
+    sa_cert_path: Option<String>,
+}
+
+impl OkeWorkloadIdentityAuthBuilder {
+    pub fn service_host(mut self, host: String) -> Self {
+        self.service_host = Some(host);
+        self
+    }
+
+    pub fn service_port(mut self, port: u16) -> Self {
+        self.service_port = Some(port);
+        self
+    }
+
+    pub fn region(mut self, region: String) -> Self {
+        self.region = Some(region);
+        self
+    }
+
+    pub fn sa_token_path(mut self, path: String) -> Self {
+        self.sa_token_path = Some(path);
+        self
+    }
+
+    pub fn sa_cert_path(mut self, path: String) -> Self {
+        self.sa_cert_path = Some(path);
+        self
+    }
+
+    pub fn build(self) -> Result<OkeWorkloadIdentityAuth, AuthError> {
+        let service_host = self
+            .service_host
+            .or_else(|| std::env::var("KUBERNETES_SERVICE_HOST").ok())
+            .ok_or_else(|| {
+                AuthError::ConfigError(
+                    "KUBERNETES_SERVICE_HOST not set and not provided".to_string(),
+                )
+            })?;
+
+        let region = self
+            .region
+            .or_else(|| std::env::var("OCI_RESOURCE_PRINCIPAL_REGION").ok());
+
+        let sa_token_path = self
+            .sa_token_path
+            .unwrap_or_else(|| OkeWorkloadIdentityAuth::DEFAULT_SA_TOKEN_PATH.to_string());
+
+        let sa_cert_path = self
+            .sa_cert_path
+            .or_else(|| std::env::var("OCI_KUBERNETES_SERVICE_ACCOUNT_CERT_PATH").ok())
+            .unwrap_or_else(|| OkeWorkloadIdentityAuth::DEFAULT_SA_CERT_PATH.to_string());
+
+        // Load CA cert for TLS verification
+        let ca_cert_pem = std::fs::read(&sa_cert_path).map_err(|e| {
+            AuthError::ConfigError(format!("Failed to read CA cert at {}: {}", sa_cert_path, e))
+        })?;
+
+        let ca_cert = reqwest::Certificate::from_pem(&ca_cert_pem)
+            .map_err(|e| AuthError::ConfigError(format!("Failed to parse CA cert: {}", e)))?;
+
+        let http_client = reqwest::Client::builder()
+            .add_root_certificate(ca_cert)
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| AuthError::ConfigError(format!("Failed to build HTTP client: {}", e)))?;
+
+        let imds_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| AuthError::ConfigError(format!("Failed to build IMDS client: {}", e)))?;
+
+        Ok(OkeWorkloadIdentityAuth {
+            credentials: Arc::new(RwLock::new(None)),
+            region,
+            service_host,
+            service_port: self
+                .service_port
+                .unwrap_or(OkeWorkloadIdentityAuth::PROXYMUX_PORT),
+            sa_token_path,
+            sa_cert_path,
+            http_client,
+            imds_client,
+        })
     }
 }
 
