@@ -24,6 +24,7 @@ thiserror = "1.0"
 async-trait = "0.1"
 pem = "3.0"
 urlencoding = "2.1"
+tracing = "0.1"
 clap = { version = "4", features = ["derive"], optional = true }
 
 [dev-dependencies]
