@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tokio::sync::RwLock;
+use tracing::{debug, error, info, instrument, warn};
 use x509_parser::prelude::*;
 
 /// Errors that can occur during authentication
@@ -1032,9 +1033,20 @@ impl OkeWorkloadIdentityAuth {
 
     /// Read K8s service account token
     fn read_sa_token(&self) -> Result<String, AuthError> {
+        debug!(path = %self.sa_token_path, "Reading K8s service account token");
         std::fs::read_to_string(&self.sa_token_path)
-            .map(|s| s.trim().to_string())
+            .map(|s| {
+                let token = s.trim().to_string();
+                let token_preview = if token.len() > 20 {
+                    format!("{}...{}", &token[..10], &token[token.len()-10..])
+                } else {
+                    "[short]".to_string()
+                };
+                debug!(path = %self.sa_token_path, token_preview = %token_preview, "Successfully read SA token");
+                token
+            })
             .map_err(|e| {
+                error!(path = %self.sa_token_path, error = %e, "Failed to read K8s SA token");
                 AuthError::ConfigError(format!(
                     "Failed to read K8s SA token at {}: {}",
                     self.sa_token_path, e
@@ -1043,7 +1055,10 @@ impl OkeWorkloadIdentityAuth {
     }
 
     /// Fetch resource principal session token from proxymux
+    #[instrument(skip(self), fields(host = %self.service_host, port = %self.service_port))]
     async fn fetch_session_token(&self) -> Result<InstanceCredentials, AuthError> {
+        debug!("Starting session token fetch from proxymux");
+
         let sa_token = self.read_sa_token()?;
         let session_key_pair = Self::generate_session_keypair()?;
         let public_key_pem = Self::extract_public_key_pem(&session_key_pair)?;
@@ -1054,6 +1069,13 @@ impl OkeWorkloadIdentityAuth {
             self.service_host,
             self.service_port,
             Self::PROXYMUX_PATH
+        );
+
+        debug!(
+            url = %url,
+            service_host = %self.service_host,
+            service_port = %self.service_port,
+            "Calling proxymux endpoint"
         );
 
         let body = serde_json::json!({
@@ -1069,9 +1091,24 @@ impl OkeWorkloadIdentityAuth {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
+        let status = response.status();
+        debug!(status = %status, "Received response from proxymux");
+
+        if !status.is_success() {
+            let headers = response.headers().clone();
             let body = response.text().await.unwrap_or_default();
+
+            warn!(
+                status = %status,
+                status_code = status.as_u16(),
+                body = %body,
+                headers = ?headers,
+                url = %url,
+                service_host = %self.service_host,
+                service_port = %self.service_port,
+                "Proxymux request failed"
+            );
+
             return Err(AuthError::MetadataError(format!(
                 "Proxymux request failed: {} - {}",
                 status, body
@@ -1080,7 +1117,13 @@ impl OkeWorkloadIdentityAuth {
 
         // Response is base64-encoded JSON
         let response_text = response.text().await?;
+        debug!(
+            response_len = response_text.len(),
+            "Received base64-encoded response"
+        );
+
         let decoded = BASE64.decode(response_text.as_bytes()).map_err(|e| {
+            error!(error = %e, "Failed to decode base64 response");
             AuthError::InvalidKeyFormat(format!("Failed to decode response: {}", e))
         })?;
 
@@ -1089,21 +1132,34 @@ impl OkeWorkloadIdentityAuth {
         // Parse JWT to get expiry
         let parts: Vec<&str> = proxymux_response.token.split('.').collect();
         if parts.len() != 3 {
+            error!("Invalid JWT format: expected 3 parts, got {}", parts.len());
             return Err(AuthError::InvalidKeyFormat(
                 "Invalid JWT format".to_string(),
             ));
         }
 
-        let payload = BASE64
-            .decode(parts[1])
-            .map_err(|e| AuthError::InvalidKeyFormat(format!("Failed to decode JWT: {}", e)))?;
+        let payload = BASE64.decode(parts[1]).map_err(|e| {
+            error!(error = %e, "Failed to decode JWT payload");
+            AuthError::InvalidKeyFormat(format!("Failed to decode JWT: {}", e))
+        })?;
 
         let claims: serde_json::Value = serde_json::from_slice(&payload)?;
-        let exp = claims["exp"]
-            .as_u64()
-            .ok_or_else(|| AuthError::InvalidKeyFormat("No exp claim in token".to_string()))?;
+        let exp = claims["exp"].as_u64().ok_or_else(|| {
+            error!("No exp claim in token");
+            AuthError::InvalidKeyFormat("No exp claim in token".to_string())
+        })?;
 
         let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(exp);
+
+        if let Ok(duration) = expires_at.duration_since(SystemTime::now()) {
+            info!(
+                expires_in_secs = duration.as_secs(),
+                expires_at_unix = exp,
+                "Successfully fetched session token"
+            );
+        } else {
+            warn!(expires_at_unix = exp, "Token already expired");
+        }
 
         Ok(InstanceCredentials {
             security_token: proxymux_response.token,
@@ -1113,6 +1169,7 @@ impl OkeWorkloadIdentityAuth {
     }
 
     /// Get valid credentials, refreshing at half-life
+    #[instrument(skip(self))]
     async fn get_credentials(&self) -> Result<(), AuthError> {
         {
             let guard = self.credentials.read().await;
@@ -1124,14 +1181,29 @@ impl OkeWorkloadIdentityAuth {
                     // We need to know when it was issued to calculate half-life
                     // For simplicity, assume tokens are valid for 1 hour and refresh at 30 min remaining
                     if time_until_expiry > Duration::from_secs(1800) {
+                        debug!(
+                            time_until_expiry_secs = time_until_expiry.as_secs(),
+                            "Credentials cache hit - token still valid"
+                        );
                         return Ok(());
+                    } else {
+                        debug!(
+                            time_until_expiry_secs = time_until_expiry.as_secs(),
+                            "Credentials need refresh - approaching expiry"
+                        );
                     }
+                } else {
+                    warn!("Token expired, refreshing");
                 }
+            } else {
+                debug!("No cached credentials, fetching new token");
             }
         }
 
+        debug!("Fetching new session token");
         let creds = self.fetch_session_token().await?;
         *self.credentials.write().await = Some(creds);
+        debug!("Credentials refreshed successfully");
         Ok(())
     }
 
@@ -1158,6 +1230,7 @@ impl OkeWorkloadIdentityAuth {
 
 #[async_trait]
 impl AuthProvider for OkeWorkloadIdentityAuth {
+    #[instrument(skip(self, headers), fields(method = %method, path = %path, host = %host))]
     async fn sign_request(
         &self,
         headers: &mut HeaderMap,
@@ -1165,6 +1238,7 @@ impl AuthProvider for OkeWorkloadIdentityAuth {
         path: &str,
         host: &str,
     ) -> Result<(), AuthError> {
+        debug!("Starting request signing");
         self.get_credentials().await?;
 
         let guard = self.credentials.read().await;
@@ -1192,6 +1266,7 @@ impl AuthProvider for OkeWorkloadIdentityAuth {
                 AuthError::SigningError(format!("Invalid authorization header: {}", e))
             })?,
         );
+        debug!("Request signed successfully");
         Ok(())
     }
 
