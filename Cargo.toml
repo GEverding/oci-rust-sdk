@@ -29,6 +29,7 @@ urlencoding = "2.1"
 bytes = "1"
 tracing = "0.1"
 clap = { version = "4", features = ["derive"], optional = true }
+indicatif = { version = "0.17", optional = true }
 
 [dev-dependencies]
 gethostname = "0.4"
@@ -36,7 +37,7 @@ futures = "0.3"
 
 [features]
 default = []
-cli = ["clap"]
+cli = ["dep:clap", "dep:indicatif"]
 
 [[bin]]
 name = "oci-dataflow"

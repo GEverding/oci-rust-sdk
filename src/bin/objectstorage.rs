@@ -1,9 +1,14 @@
+use std::sync::Arc;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::StreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
 use oci_sdk::{
     auth::{AuthProvider, ConfigFileAuth, InstancePrincipalAuth, OkeWorkloadIdentityAuth},
     objectstorage::{
-        ListObjectsRequest, ObjectStorageClient, ObjectStorageError, RestoreObjectsDetails,
+        BucketListingAction, CreatePreauthenticatedRequestDetails, ListObjectsRequest,
+        MultipartUploadConfig, ObjectStorageClient, ObjectStorageError, PreauthAccessType,
+        ProgressEvent, RestoreObjectsDetails,
     },
 };
 use tokio::io::AsyncWriteExt;
@@ -16,6 +21,42 @@ enum AuthMode {
     InstancePrincipal,
     /// Use OKE workload identity (for Kubernetes)
     WorkloadIdentity,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum CliAccessType {
+    ObjectRead,
+    ObjectWrite,
+    ObjectReadWrite,
+    AnyObjectRead,
+    AnyObjectWrite,
+    AnyObjectReadWrite,
+}
+
+impl From<CliAccessType> for PreauthAccessType {
+    fn from(ct: CliAccessType) -> Self {
+        match ct {
+            CliAccessType::ObjectRead => PreauthAccessType::ObjectRead,
+            CliAccessType::ObjectWrite => PreauthAccessType::ObjectWrite,
+            CliAccessType::ObjectReadWrite => PreauthAccessType::ObjectReadWrite,
+            CliAccessType::AnyObjectRead => PreauthAccessType::AnyObjectRead,
+            CliAccessType::AnyObjectWrite => PreauthAccessType::AnyObjectWrite,
+            CliAccessType::AnyObjectReadWrite => PreauthAccessType::AnyObjectReadWrite,
+        }
+    }
+}
+
+fn progress_bar(total: u64) -> ProgressBar {
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("█▉▊▋▌▍▎▏  "),
+    );
+    pb
 }
 
 #[derive(Parser)]
@@ -93,7 +134,7 @@ enum Commands {
         hours: Option<u32>,
     },
 
-    /// Download an object to a file (streaming)
+    /// Download an object to a file (streaming, with progress bar)
     GetObject {
         /// Object name/path
         #[arg(short, long)]
@@ -104,8 +145,8 @@ enum Commands {
         output: String,
     },
 
-    /// Upload a file as an object
-    PutObject {
+    /// Upload a file (auto-selects single or multipart based on size)
+    Upload {
         /// Object name/path
         #[arg(short, long)]
         name: String,
@@ -115,8 +156,56 @@ enum Commands {
         file: String,
 
         /// Content-Type header (default: application/octet-stream)
-        #[arg(long, global = true)]
+        #[arg(long)]
         content_type: Option<String>,
+
+        /// Part size in MiB for multipart upload (default: 128)
+        #[arg(long, default_value = "128")]
+        part_size_mib: usize,
+
+        /// Concurrency for multipart upload (default: 8)
+        #[arg(long, default_value = "8")]
+        concurrency: usize,
+    },
+
+    /// Create a pre-authenticated request (PAR)
+    CreatePar {
+        /// Human-readable name for the PAR
+        #[arg(long)]
+        name: String,
+
+        /// Access type
+        #[arg(long, value_enum)]
+        access_type: CliAccessType,
+
+        /// Expiration time (RFC 3339, e.g. 2025-12-31T23:59:59Z)
+        #[arg(long)]
+        expires: String,
+
+        /// Object name (required for Object* access types)
+        #[arg(long)]
+        object_name: Option<String>,
+
+        /// Allow listing objects (only for AnyObject* types)
+        #[arg(long)]
+        allow_listing: bool,
+    },
+
+    /// Get details of a pre-authenticated request
+    GetPar {
+        /// PAR ID
+        #[arg(long)]
+        par_id: String,
+    },
+
+    /// List pre-authenticated requests
+    ListPars,
+
+    /// Delete a pre-authenticated request
+    DeletePar {
+        /// PAR ID
+        #[arg(long)]
+        par_id: String,
     },
 }
 
@@ -144,7 +233,7 @@ async fn run_command<A: AuthProvider>(
                 start: start.as_deref(),
                 ..Default::default()
             };
-            let resp = client.list_objects(&bucket, &request).await?;
+            let resp = client.list_objects(bucket, &request).await?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
@@ -193,7 +282,7 @@ async fn run_command<A: AuthProvider>(
         }
 
         Commands::HeadObject { name } => {
-            let meta = client.head_object(&bucket, &name).await?;
+            let meta = client.head_object(bucket, &name).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&meta)?);
             } else {
@@ -217,7 +306,7 @@ async fn run_command<A: AuthProvider>(
             if let Some(h) = hours {
                 details = details.hours(h);
             }
-            let resp = client.restore_objects(&bucket, &details).await?;
+            let resp = client.restore_objects(bucket, &details).await?;
             if json {
                 println!(
                     "{}",
@@ -235,10 +324,11 @@ async fn run_command<A: AuthProvider>(
         }
 
         Commands::GetObject { name, output } => {
-            let resp = client.get_object(&bucket, &name).await?;
+            let resp = client.get_object(bucket, &name).await?;
 
-            if let Some(len) = resp.content_length {
-                eprintln!("Content-Length: {} bytes", len);
+            let pb = progress_bar(resp.content_length.unwrap_or(0));
+            if resp.content_length.is_none() {
+                pb.set_length(0);
             }
 
             let opc_request_id = resp.opc_request_id.clone();
@@ -253,8 +343,10 @@ async fn run_command<A: AuthProvider>(
                 let chunk = chunk?;
                 file.write_all(&chunk).await?;
                 total += chunk.len() as u64;
+                pb.set_position(total);
             }
             file.flush().await?;
+            pb.finish_with_message("done");
 
             if json {
                 println!(
@@ -272,34 +364,173 @@ async fn run_command<A: AuthProvider>(
             }
         }
 
-        Commands::PutObject {
+        Commands::Upload {
             name,
             file,
             content_type,
+            part_size_mib,
+            concurrency,
         } => {
-            let data = tokio::fs::read(&file).await?;
-            let size = data.len();
-            let opc = client
-                .put_object(
-                    &bucket,
-                    &name,
-                    bytes::Bytes::from(data),
-                    content_type.as_deref(),
-                )
+            let metadata = tokio::fs::metadata(&file).await?;
+            let file_size = metadata.len();
+            let part_size = part_size_mib * 1024 * 1024;
+
+            if file_size <= part_size as u64 {
+                // Single put_object
+                let data = tokio::fs::read(&file).await?;
+                let pb = progress_bar(file_size);
+                pb.set_position(file_size); // single shot — data already in memory
+                let opc = client
+                    .put_object(
+                        bucket,
+                        &name,
+                        bytes::Bytes::from(data),
+                        content_type.as_deref(),
+                    )
+                    .await?;
+                pb.finish_with_message("done");
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "bytesUploaded": file_size,
+                            "opcRequestId": opc,
+                            "multipart": false,
+                        }))?
+                    );
+                } else {
+                    println!("Uploaded {} bytes (single request)", file_size);
+                    if let Some(req_id) = opc {
+                        println!("Request ID: {}", req_id);
+                    }
+                }
+            } else {
+                // Multipart upload
+                let pb = progress_bar(file_size);
+                let pb_clone = pb.clone();
+                let config = MultipartUploadConfig {
+                    part_size,
+                    concurrency,
+                    progress: Some(Arc::new(move |event: ProgressEvent| {
+                        pb_clone.set_position(event.bytes_transferred);
+                    })),
+                };
+
+                let f = tokio::fs::File::open(&file).await?;
+                let resp = client
+                    .upload_file(bucket, &name, f, Some(file_size), Some(config))
+                    .await?;
+                pb.finish_with_message("done");
+
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "bytesUploaded": resp.total_bytes,
+                            "partsUploaded": resp.parts_uploaded,
+                            "opcRequestId": resp.opc_request_id,
+                            "etag": resp.etag,
+                            "multipart": true,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "Uploaded {} bytes ({} parts)",
+                        resp.total_bytes, resp.parts_uploaded
+                    );
+                    if let Some(req_id) = resp.opc_request_id {
+                        println!("Request ID: {}", req_id);
+                    }
+                }
+            }
+        }
+
+        Commands::CreatePar {
+            name,
+            access_type,
+            expires,
+            object_name,
+            allow_listing,
+        } => {
+            let details = CreatePreauthenticatedRequestDetails {
+                name,
+                access_type: access_type.into(),
+                time_expires: expires,
+                object_name,
+                bucket_listing_action: if allow_listing {
+                    Some(BucketListingAction::ListObjects)
+                } else {
+                    None
+                },
+            };
+            let par = client
+                .create_preauthenticated_request(bucket, &details)
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&par)?);
+            } else {
+                println!("PAR Created:");
+                println!("  ID:         {}", par.id);
+                println!("  Name:       {}", par.name);
+                println!("  Access:     {:?}", par.access_type);
+                println!("  Expires:    {}", par.time_expires);
+                if let Some(url) = &par.full_url {
+                    println!("  URL:        {}", url);
+                }
+                eprintln!("\n⚠ Save the URL now — it cannot be retrieved later.");
+            }
+        }
+
+        Commands::GetPar { par_id } => {
+            let par = client.get_preauthenticated_request(bucket, &par_id).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&par)?);
+            } else {
+                println!("ID:        {}", par.id);
+                println!("Name:      {}", par.name);
+                println!("Access:    {:?}", par.access_type);
+                println!("Object:    {}", par.object_name.as_deref().unwrap_or("-"));
+                println!("Expires:   {}", par.time_expires);
+                println!("Created:   {}", par.time_created.as_deref().unwrap_or("-"));
+            }
+        }
+
+        Commands::ListPars => {
+            let pars = client.list_preauthenticated_requests(bucket).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&pars)?);
+            } else {
+                println!(
+                    "{:<40} {:<30} {:<20} {:<30}",
+                    "ID", "NAME", "ACCESS", "EXPIRES"
+                );
+                println!("{}", "-".repeat(120));
+                for par in &pars {
+                    println!(
+                        "{:<40} {:<30} {:<20} {:<30}",
+                        par.id,
+                        par.name,
+                        format!("{:?}", par.access_type),
+                        par.time_expires
+                    );
+                }
+            }
+        }
+
+        Commands::DeletePar { par_id } => {
+            client
+                .delete_preauthenticated_request(bucket, &par_id)
                 .await?;
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "bytesUploaded": size,
-                        "opcRequestId": opc,
+                        "status": "deleted",
+                        "parId": par_id,
                     }))?
                 );
             } else {
-                println!("Uploaded {} bytes.", size);
-                if let Some(req_id) = opc {
-                    println!("Request ID: {}", req_id);
-                }
+                println!("Deleted PAR: {}", par_id);
             }
         }
     }

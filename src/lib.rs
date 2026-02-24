@@ -51,7 +51,11 @@ pub use dataflow::{
     RunLogSummary, RunSummary,
 };
 pub use objectstorage::{
-    ArchivalState, GetObjectResponse, ListObjectsRequest, ListObjectsResponse, ObjectMetadata,
-    ObjectStorageClient, ObjectStorageError, ObjectSummary, RestoreObjectsDetails,
-    RestoreObjectsResponse, StorageTier,
+    ArchivalState, BucketListingAction, CommitMultipartUploadDetails,
+    CommitMultipartUploadPartDetails, CreateMultipartUploadDetails,
+    CreatePreauthenticatedRequestDetails, GetObjectResponse, ListObjectsRequest,
+    ListObjectsResponse, MultipartUpload, MultipartUploadConfig, MultipartUploadPartSummary,
+    ObjectMetadata, ObjectStorageClient, ObjectStorageError, ObjectSummary, PreauthAccessType,
+    PreauthenticatedRequest, PreauthenticatedRequestSummary, ProgressEvent, ProgressKind,
+    RestoreObjectsDetails, RestoreObjectsResponse, StorageTier, UploadFileResponse,
 };
