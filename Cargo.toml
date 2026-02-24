@@ -8,7 +8,9 @@ repository = "https://github.com/digital-divas/oci-rust-sdk"
 readme = "README.md"
 
 [dependencies]
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
+futures-core = "0.3"
+futures-util = "0.3"
 tokio = { version = "1", features = ["full"] }
 aws-lc-rs = { version = "1.13", features = ["ring-io", "ring-sig-verify"] }
 base64 = "0.22"
@@ -24,6 +26,7 @@ thiserror = "1.0"
 async-trait = "0.1"
 pem = "3.0"
 urlencoding = "2.1"
+bytes = "1"
 tracing = "0.1"
 clap = { version = "4", features = ["derive"], optional = true }
 
@@ -38,6 +41,11 @@ cli = ["clap"]
 [[bin]]
 name = "oci-dataflow"
 path = "src/bin/dataflow.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "oci-objectstorage"
+path = "src/bin/objectstorage.rs"
 required-features = ["cli"]
 
 [[example]]

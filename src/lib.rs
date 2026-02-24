@@ -38,6 +38,7 @@ pub mod config;
 pub mod dataflow;
 pub mod identity;
 pub mod nosql;
+pub mod objectstorage;
 pub mod queue;
 pub mod secrets;
 
@@ -48,4 +49,9 @@ pub use auth::{
 pub use dataflow::{
     CreateRunDetails, DataFlowClient, DataFlowError, ListRunsParams, Run, RunLifecycleState,
     RunLogSummary, RunSummary,
+};
+pub use objectstorage::{
+    ArchivalState, GetObjectResponse, ListObjectsRequest, ListObjectsResponse, ObjectMetadata,
+    ObjectStorageClient, ObjectStorageError, ObjectSummary, RestoreObjectsDetails,
+    RestoreObjectsResponse, StorageTier,
 };

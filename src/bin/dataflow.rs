@@ -207,7 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_command(client, cli.command).await
         }
         AuthMode::WorkloadIdentity => {
-            let auth = OkeWorkloadIdentityAuth::new(cli.region.clone(), None);
+            let auth = OkeWorkloadIdentityAuth::new()?;
             let client = DataFlowClient::new(auth, &cli.region);
             run_command(client, cli.command).await
         }
