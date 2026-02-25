@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, instrument, warn};
 use x509_parser::prelude::*;
 
@@ -390,6 +390,7 @@ pub struct InstancePrincipalAuth {
     metadata_base_url: String,
     federation_endpoint: Option<String>,
     refresh_buffer_secs: u64,
+    refresh_lock: Arc<Mutex<()>>, // prevents thundering herd on IMDS
 }
 
 impl InstancePrincipalAuth {
@@ -405,6 +406,7 @@ impl InstancePrincipalAuth {
             metadata_base_url: "http://169.254.169.254/opc/v2".to_string(),
             federation_endpoint: None,
             refresh_buffer_secs: 300, // 5 minutes before expiry
+            refresh_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -429,7 +431,18 @@ impl InstancePrincipalAuth {
 
     /// Fetch region from IMDS
     async fn fetch_region(&self) -> Result<String, AuthError> {
-        // Check cache first
+        // Fast path: check cache
+        {
+            let guard = self.region.read().await;
+            if let Some(ref region) = *guard {
+                return Ok(region.clone());
+            }
+        }
+
+        // Serialize IMDS calls
+        let _lock = self.refresh_lock.lock().await;
+
+        // Double-check after acquiring lock
         {
             let guard = self.region.read().await;
             if let Some(ref region) = *guard {
@@ -817,6 +830,21 @@ impl InstancePrincipalAuth {
 
     /// Get valid credentials, refreshing if needed
     async fn get_credentials(&self) -> Result<(), AuthError> {
+        // Fast path: check if credentials are still valid
+        {
+            let guard = self.credentials.read().await;
+            if let Some(ref creds) = *guard {
+                let buffer = Duration::from_secs(self.refresh_buffer_secs);
+                if creds.expires_at > SystemTime::now() + buffer {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Serialize refreshes — only one task hits IMDS
+        let _lock = self.refresh_lock.lock().await;
+
+        // Double-check: another task may have refreshed while we waited
         {
             let guard = self.credentials.read().await;
             if let Some(ref creds) = *guard {
@@ -832,7 +860,18 @@ impl InstancePrincipalAuth {
 
     /// Fetch tenancy ID from instance metadata
     async fn fetch_tenancy_id(&self) -> Result<String, AuthError> {
-        // Check cache
+        // Fast path: check cache
+        {
+            let guard = self.tenancy_id.read().await;
+            if let Some(ref id) = *guard {
+                return Ok(id.clone());
+            }
+        }
+
+        // Serialize IMDS calls
+        let _lock = self.refresh_lock.lock().await;
+
+        // Double-check after acquiring lock
         {
             let guard = self.tenancy_id.read().await;
             if let Some(ref id) = *guard {
