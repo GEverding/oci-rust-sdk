@@ -8,7 +8,10 @@
 use async_trait::async_trait;
 use aws_lc_rs::rsa::KeySize;
 use aws_lc_rs::signature::{KeyPair, RsaKeyPair, RSA_PKCS1_SHA256};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64_URL},
+    Engine,
+};
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use sha1::Sha1;
@@ -63,6 +66,10 @@ pub trait AuthProvider: Send + Sync {
 
     /// Get the region identifier
     async fn get_region(&self) -> Result<String, AuthError>;
+
+    /// Invalidate cached credentials, forcing re-authentication on the next request.
+    /// Default is a no-op (e.g., API key auth never expires).
+    async fn invalidate_credentials(&self) {}
 }
 
 /// Compute SHA256 hash of body and return base64-encoded result
@@ -71,6 +78,23 @@ pub fn encode_body(body: &str) -> String {
     hasher.update(body.as_bytes());
     let result = hasher.finalize();
     BASE64.encode(result)
+}
+
+/// Try to extract `exp` claim from a JWT security token.
+/// Returns `None` if the token isn't a valid JWT or doesn't contain an `exp` claim.
+fn parse_jwt_expiry(token: &str) -> Option<SystemTime> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    // JWT uses URL-safe base64 no-pad, but OCI sometimes uses standard — try both
+    let payload = BASE64_URL
+        .decode(parts[1])
+        .or_else(|_| BASE64.decode(parts[1]))
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    let exp = claims["exp"].as_u64()?;
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(exp))
 }
 
 /// Build the signing string and sign it with the provided key pair
@@ -394,6 +418,11 @@ pub struct InstancePrincipalAuth {
 }
 
 impl InstancePrincipalAuth {
+    /// Maximum number of IMDS request attempts (initial + retries)
+    const IMDS_MAX_ATTEMPTS: u32 = 8;
+    /// Maximum sleep between retries (30 seconds)
+    const IMDS_BACKOFF_CAP_SECS: u64 = 30;
+
     /// Create a new Instance Principal authenticator
     ///
     /// # Arguments
@@ -429,6 +458,112 @@ impl InstancePrincipalAuth {
             .unwrap_or_else(|_| reqwest::Client::new())
     }
 
+    /// Returns true for status codes that warrant a retry: 404, 429, and any 5xx.
+    fn is_retryable_imds_status(status: reqwest::StatusCode) -> bool {
+        status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error()
+    }
+
+    /// Exponential backoff with simple time-based jitter, capped at `IMDS_BACKOFF_CAP_SECS`.
+    ///
+    /// `attempt` is 0-indexed (0 = first retry, after the initial attempt failed).
+    fn compute_imds_backoff(attempt: u32) -> Duration {
+        // base = 2^attempt seconds, capped (checked_shl returns None on overflow)
+        let base_secs: u64 = 1u64
+            .checked_shl(attempt)
+            .unwrap_or(u64::MAX)
+            .min(Self::IMDS_BACKOFF_CAP_SECS);
+        // Jitter: use nanos of current time modulo base_secs (avoids new deps)
+        let jitter_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64 % base_secs.max(1))
+            .unwrap_or(0);
+        Duration::from_secs(
+            base_secs
+                .saturating_add(jitter_secs)
+                .min(Self::IMDS_BACKOFF_CAP_SECS),
+        )
+    }
+
+    /// GET `{metadata_base_url}/{path}` with `Authorization: Bearer Oracle`, retrying on
+    /// transient errors (transport failures, 404, 429, 5xx) up to `IMDS_MAX_ATTEMPTS` total.
+    ///
+    /// Non-retryable 4xx responses (anything except 404/429) fail immediately.
+    async fn imds_get_with_retry(
+        &self,
+        path: &str,
+        what: &str,
+    ) -> Result<reqwest::Response, AuthError> {
+        let url = format!("{}/{}", self.metadata_base_url, path);
+        let client = self.get_http_client().await;
+        let mut last_err: Option<AuthError> = None;
+
+        for attempt in 0..Self::IMDS_MAX_ATTEMPTS {
+            if attempt > 0 {
+                let backoff = Self::compute_imds_backoff(attempt - 1);
+                warn!(
+                    what = %what,
+                    attempt = attempt,
+                    backoff_secs = backoff.as_secs(),
+                    "IMDS request failed, retrying"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+
+            let send_result = client
+                .get(&url)
+                .header("Authorization", "Bearer Oracle")
+                .send()
+                .await;
+
+            match send_result {
+                Err(e) => {
+                    warn!(
+                        what = %what,
+                        attempt = attempt + 1,
+                        max_attempts = Self::IMDS_MAX_ATTEMPTS,
+                        error = %e,
+                        "IMDS transport error"
+                    );
+                    last_err = Some(AuthError::HttpError(e));
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        return Ok(resp);
+                    }
+                    if Self::is_retryable_imds_status(status) {
+                        warn!(
+                            what = %what,
+                            attempt = attempt + 1,
+                            max_attempts = Self::IMDS_MAX_ATTEMPTS,
+                            status = %status,
+                            "IMDS retryable status"
+                        );
+                        last_err = Some(AuthError::MetadataError(format!(
+                            "IMDS {what} returned {status} (attempt {}/{})",
+                            attempt + 1,
+                            Self::IMDS_MAX_ATTEMPTS
+                        )));
+                    } else {
+                        // Non-retryable 4xx — fail fast
+                        return Err(AuthError::MetadataError(format!(
+                            "IMDS {what} returned non-retryable status {status}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            AuthError::MetadataError(format!(
+                "IMDS {what} failed after {} attempts",
+                Self::IMDS_MAX_ATTEMPTS
+            ))
+        }))
+    }
+
     /// Fetch region from IMDS
     async fn fetch_region(&self) -> Result<String, AuthError> {
         // Fast path: check cache
@@ -450,22 +585,9 @@ impl InstancePrincipalAuth {
             }
         }
 
-        let client = self.get_http_client().await;
-
-        // Try to get region from instance metadata
-        let response = client
-            .get(&format!("{}/instance/region", self.metadata_base_url))
-            .header("Authorization", "Bearer Oracle")
-            .send()
+        let response = self
+            .imds_get_with_retry("instance/region", "region")
             .await?;
-
-        if !response.status().is_success() {
-            return Err(AuthError::MetadataError(format!(
-                "Failed to get region: {}",
-                response.status()
-            )));
-        }
-
         let region = response.text().await?;
         let region = normalize_region(region.trim());
 
@@ -475,52 +597,30 @@ impl InstancePrincipalAuth {
 
     /// Fetch the leaf certificate and private key from IMDS
     async fn fetch_certificate_and_key(&self) -> Result<(String, String, String), AuthError> {
-        let client = self.get_http_client().await;
-
-        // Get the identity certificate
-        let cert_response = client
-            .get(&format!("{}/identity/cert.pem", self.metadata_base_url))
-            .header("Authorization", "Bearer Oracle")
-            .send()
+        // Required: leaf certificate
+        let cert = self
+            .imds_get_with_retry("identity/cert.pem", "certificate")
+            .await?
+            .text()
             .await?;
 
-        if !cert_response.status().is_success() {
-            return Err(AuthError::MetadataError(format!(
-                "Failed to get certificate: {}",
-                cert_response.status()
-            )));
-        }
-        let cert = cert_response.text().await?;
-
-        // Get the private key
-        let key_response = client
-            .get(&format!("{}/identity/key.pem", self.metadata_base_url))
-            .header("Authorization", "Bearer Oracle")
-            .send()
+        // Required: private key
+        let private_key = self
+            .imds_get_with_retry("identity/key.pem", "private key")
+            .await?
+            .text()
             .await?;
 
-        if !key_response.status().is_success() {
-            return Err(AuthError::MetadataError(format!(
-                "Failed to get private key: {}",
-                key_response.status()
-            )));
-        }
-        let private_key = key_response.text().await?;
-
-        // Get the intermediate certificate
-        let intermediate_response = client
-            .get(&format!(
-                "{}/identity/intermediate.pem",
-                self.metadata_base_url
-            ))
-            .header("Authorization", "Bearer Oracle")
-            .send()
-            .await?;
-
-        let intermediate_cert = if intermediate_response.status().is_success() {
-            intermediate_response.text().await?
-        } else {
-            String::new()
+        // Optional: intermediate certificate — log and continue on failure
+        let intermediate_cert = match self
+            .imds_get_with_retry("identity/intermediate.pem", "intermediate certificate")
+            .await
+        {
+            Ok(resp) => resp.text().await?,
+            Err(e) => {
+                warn!(error = %e, "Failed to fetch intermediate certificate after retries; continuing without it");
+                String::new()
+            }
         };
 
         Ok((cert, intermediate_cert, private_key))
@@ -816,12 +916,24 @@ impl InstancePrincipalAuth {
             .fetch_security_token(&cert, &intermediate_cert, &leaf_key_pair)
             .await?;
 
-        // Security tokens typically expire in 1 hour
-        let expires_at = SystemTime::now() + Duration::from_secs(3600);
+        // Parse JWT to get actual expiry — tokens may be shorter than 1 hour
+        let expires_at = parse_jwt_expiry(&security_token).unwrap_or_else(|| {
+            warn!("Could not parse JWT exp claim from security token, assuming 1 hour TTL");
+            SystemTime::now() + Duration::from_secs(3600)
+        });
+
+        if let Ok(duration) = expires_at.duration_since(SystemTime::now()) {
+            debug!(
+                expires_in_secs = duration.as_secs(),
+                "Refreshed instance principal credentials"
+            );
+        } else {
+            warn!("Instance principal security token already expired at refresh time");
+        }
 
         *self.credentials.write().await = Some(InstanceCredentials {
             security_token,
-            session_key_pair, // Store the session key pair for signing API requests
+            session_key_pair,
             expires_at,
         });
 
@@ -879,21 +991,9 @@ impl InstancePrincipalAuth {
             }
         }
 
-        let client = self.get_http_client().await;
-
-        let response = client
-            .get(&format!("{}/instance/", self.metadata_base_url))
-            .header("Authorization", "Bearer Oracle")
-            .send()
+        let response = self
+            .imds_get_with_retry("instance/", "instance metadata")
             .await?;
-
-        if !response.status().is_success() {
-            return Err(AuthError::MetadataError(format!(
-                "Failed to get instance metadata: {}",
-                response.status()
-            )));
-        }
-
         let metadata: InstanceMetadata = response.json().await?;
 
         // tenantId might be in the metadata, or we extract from compartmentId
@@ -950,6 +1050,10 @@ impl AuthProvider for InstancePrincipalAuth {
 
     async fn get_region(&self) -> Result<String, AuthError> {
         self.fetch_region().await
+    }
+
+    async fn invalidate_credentials(&self) {
+        *self.credentials.write().await = None;
     }
 }
 
@@ -1169,35 +1273,18 @@ impl OkeWorkloadIdentityAuth {
         let proxymux_response: ProxymuxResponse = serde_json::from_slice(&decoded)?;
 
         // Parse JWT to get expiry
-        let parts: Vec<&str> = proxymux_response.token.split('.').collect();
-        if parts.len() != 3 {
-            error!("Invalid JWT format: expected 3 parts, got {}", parts.len());
-            return Err(AuthError::InvalidKeyFormat(
-                "Invalid JWT format".to_string(),
-            ));
-        }
-
-        let payload = BASE64.decode(parts[1]).map_err(|e| {
-            error!(error = %e, "Failed to decode JWT payload");
-            AuthError::InvalidKeyFormat(format!("Failed to decode JWT: {}", e))
-        })?;
-
-        let claims: serde_json::Value = serde_json::from_slice(&payload)?;
-        let exp = claims["exp"].as_u64().ok_or_else(|| {
-            error!("No exp claim in token");
+        let expires_at = parse_jwt_expiry(&proxymux_response.token).ok_or_else(|| {
+            error!("Failed to parse JWT exp claim from proxymux token");
             AuthError::InvalidKeyFormat("No exp claim in token".to_string())
         })?;
-
-        let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(exp);
 
         if let Ok(duration) = expires_at.duration_since(SystemTime::now()) {
             info!(
                 expires_in_secs = duration.as_secs(),
-                expires_at_unix = exp,
                 "Successfully fetched session token"
             );
         } else {
-            warn!(expires_at_unix = exp, "Token already expired");
+            warn!("Token already expired");
         }
 
         Ok(InstanceCredentials {
@@ -1357,6 +1444,10 @@ impl AuthProvider for OkeWorkloadIdentityAuth {
 
         // 3. Auto-detect from IMDS
         self.fetch_region_from_imds().await
+    }
+
+    async fn invalidate_credentials(&self) {
+        *self.credentials.write().await = None;
     }
 }
 

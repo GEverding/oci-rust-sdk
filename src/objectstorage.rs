@@ -51,6 +51,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tracing::warn;
 
 /// Errors returned by [`ObjectStorageClient`] operations.
 #[derive(Debug, thiserror::Error)]
@@ -539,7 +540,7 @@ pub struct PreauthenticatedRequestSummary {
     pub time_created: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum RequestBody {
     Json(String),
     Bytes(bytes::Bytes, String), // (data, content_type)
@@ -623,6 +624,30 @@ impl<A: AuthProvider> ObjectStorageClient<A> {
         path: &str,
         body: RequestBody,
     ) -> Result<(reqwest::Response, Option<String>), ObjectStorageError> {
+        let (response, opc_request_id) = self.do_signed_request(method, path, &body).await?;
+        let status = response.status();
+
+        // On 401, invalidate credentials and retry once with fresh auth
+        if status.as_u16() == 401 {
+            warn!(
+                opc_request_id = opc_request_id.as_deref().unwrap_or("-"),
+                "Got 401, invalidating credentials and retrying"
+            );
+            // Consume body to free the connection
+            let _ = response.text().await;
+            self.auth.invalidate_credentials().await;
+            return self.do_signed_request(method, path, &body).await;
+        }
+
+        Ok((response, opc_request_id))
+    }
+
+    async fn do_signed_request(
+        &self,
+        method: &str,
+        path: &str,
+        body: &RequestBody,
+    ) -> Result<(reqwest::Response, Option<String>), ObjectStorageError> {
         let mut headers = HeaderMap::with_capacity(8);
 
         let date = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
@@ -632,18 +657,18 @@ impl<A: AuthProvider> ObjectStorageClient<A> {
             RequestBody::Json(s) => {
                 headers.insert("content-type", "application/json".parse()?);
                 headers.insert("content-length", s.len().to_string().parse()?);
-                headers.insert("x-content-sha256", encode_body(&s).parse()?);
-                Some(bytes::Bytes::from(s)) // zero-copy: reuses String's allocation
+                headers.insert("x-content-sha256", encode_body(s).parse()?);
+                Some(bytes::Bytes::from(s.clone()))
             }
             RequestBody::Bytes(data, content_type) => {
                 use base64::Engine;
                 use sha2::{Digest, Sha256};
-                let hash = Sha256::digest(&data);
+                let hash = Sha256::digest(data);
                 let sha256 = base64::engine::general_purpose::STANDARD.encode(hash);
                 headers.insert("content-type", content_type.parse()?);
                 headers.insert("content-length", data.len().to_string().parse()?);
                 headers.insert("x-content-sha256", sha256.parse()?);
-                Some(data) // already owned, no clone needed
+                Some(data.clone())
             }
             RequestBody::None => None,
         };
@@ -690,7 +715,6 @@ impl<A: AuthProvider> ObjectStorageClient<A> {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
-            // consume body to free connection
             let _ = response.text().await;
             return Err(ObjectStorageError::RateLimited {
                 opc_request_id,
