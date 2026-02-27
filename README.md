@@ -261,33 +261,6 @@ let client = ObjectStorageClient::with_client(auth, "namespace", None, http_clie
 
 > **Note:** `put_object` requires the full object body in memory to compute the `x-content-sha256` header required by OCI. For objects larger than ~100MB, multipart upload is recommended (not yet implemented).
 
-## Development
-
-### OCI Emulator
-
-Use [oci-emulator](https://github.com/cameritelabs/oci-emulator) for local development and testing:
-
-```bash
-docker run -d --name oci-emulator -p 12000:12000 cameritelabs/oci-emulator:latest
-```
-
-Pass the emulator URL as the `service_endpoint` (the `region` parameter is ignored when using a custom endpoint — construct the client and override the endpoint directly, or use the emulator-aware constructors if your client supports them).
-
-### Running Tests
-
-```bash
-cargo test
-```
-
-For coverage with [tarpaulin](https://github.com/xd009642/tarpaulin):
-
-```bash
-cargo install tarpaulin
-cargo tarpaulin --out Lcov
-```
-
-Coverage is uploaded to `codecov`. View locally in VSCode with [Coverage Gutters](https://marketplace.visualstudio.com/items?itemName=ryanluker.vscode-coverage-gutters).
-
 ## License
 
 MIT
