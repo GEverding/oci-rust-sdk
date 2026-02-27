@@ -9,6 +9,7 @@
 //! - [`ObjectStorageClient::head_object`] — Get object metadata
 //! - [`ObjectStorageClient::get_object`] — Streaming object download
 //! - [`ObjectStorageClient::put_object`] — Upload objects
+//! - [`ObjectStorageClient::delete_object`] — Delete an object
 //! - [`ObjectStorageClient::upload_file`] — High-level multipart upload with parallel parts
 //! - [`ObjectStorageClient::create_multipart_upload`] — Low-level: initiate multipart upload
 //! - [`ObjectStorageClient::upload_part`] — Low-level: upload a single part
@@ -972,6 +973,25 @@ impl<A: AuthProvider> ObjectStorageClient<A> {
             .sign_and_send_inner("put", &path, RequestBody::Bytes(body, ct.to_string()))
             .await?;
         // Consume body to ensure connection is returned to pool cleanly
+        let _ = response.text().await;
+        Ok(opc_request_id)
+    }
+
+    /// Delete an object from a bucket.
+    ///
+    /// Returns the OCI request ID on success.
+    pub async fn delete_object(
+        &self,
+        bucket: &str,
+        object_name: &str,
+    ) -> Result<Option<String>, ObjectStorageError> {
+        let path = format!(
+            "/n/{}/b/{}/o/{}",
+            urlencoding::encode(&self.namespace),
+            urlencoding::encode(bucket),
+            urlencoding::encode(object_name),
+        );
+        let (response, opc_request_id) = self.sign_and_send("delete", &path, None).await?;
         let _ = response.text().await;
         Ok(opc_request_id)
     }

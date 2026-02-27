@@ -36,7 +36,7 @@ Exactly one TLS feature must be enabled:
 
 | Service | Client | Operations |
 |---------|--------|------------|
-| Object Storage | `ObjectStorageClient` | `list_objects`, `head_object`, `get_object` (streaming), `put_object`, `restore_objects` |
+| Object Storage | `ObjectStorageClient` | `list_objects`, `head_object`, `get_object` (streaming), `put_object`, `delete_object`, `restore_objects` |
 | DataFlow | `DataFlowClient` | Spark job/run management |
 | Identity | `Identity` | User management |
 | NoSQL | `Nosql` | Table operations |

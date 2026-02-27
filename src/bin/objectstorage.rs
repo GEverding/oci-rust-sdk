@@ -145,6 +145,13 @@ enum Commands {
         output: String,
     },
 
+    /// Delete an object
+    DeleteObject {
+        /// Object name/path
+        #[arg(short, long)]
+        name: String,
+    },
+
     /// Upload a file (auto-selects single or multipart based on size)
     Upload {
         /// Object name/path
@@ -361,6 +368,25 @@ async fn run_command<A: AuthProvider>(
                 );
             } else {
                 println!("Downloaded {} bytes → {}", total, output);
+            }
+        }
+
+        Commands::DeleteObject { name } => {
+            let opc = client.delete_object(bucket, &name).await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "deleted",
+                        "objectName": name,
+                        "opcRequestId": opc,
+                    }))?
+                );
+            } else {
+                println!("Deleted object: {}", name);
+                if let Some(req_id) = opc {
+                    println!("Request ID: {}", req_id);
+                }
             }
         }
 
