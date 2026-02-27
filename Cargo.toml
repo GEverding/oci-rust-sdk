@@ -8,11 +8,13 @@ repository = "https://github.com/digital-divas/oci-rust-sdk"
 readme = "README.md"
 
 [dependencies]
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 futures-core = "0.3"
 futures-util = "0.3"
 tokio = { version = "1", features = ["full"] }
 aws-lc-rs = { version = "1.13", features = ["ring-io", "ring-sig-verify"] }
+rustls-ring = { package = "rustls", version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
+rustls-aws-lc = { package = "rustls", version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 base64 = "0.22"
 sha2 = "0.10"
 sha1 = "0.10"
@@ -36,8 +38,11 @@ gethostname = "0.4"
 futures = "0.3"
 
 [features]
-default = []
+default = ["tls-rustls-ring"]
 cli = ["dep:clap", "dep:indicatif"]
+tls-rustls-ring = ["reqwest/rustls-tls-webpki-roots", "dep:rustls-ring"]
+tls-rustls-aws-lc = ["reqwest/rustls-tls-webpki-roots", "dep:rustls-aws-lc"]
+tls-native = ["reqwest/native-tls"]
 
 [[bin]]
 name = "oci-dataflow"

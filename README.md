@@ -9,6 +9,29 @@
 
 Async Rust SDK for Oracle Cloud Infrastructure. Supports API key, Instance Principal, and OKE Workload Identity authentication. Built on `tokio` + `reqwest` with connection pooling tuned for high-throughput workloads.
 
+## TLS Backend Selection
+
+The crate defaults to `rustls` with the `ring` crypto provider.
+
+Choose a backend at compile time:
+
+```toml
+# Default (rustls + ring)
+oci-sdk = "0.4"
+
+# rustls + aws-lc
+oci-sdk = { version = "0.4", default-features = false, features = ["tls-rustls-aws-lc"] }
+
+# native-tls
+oci-sdk = { version = "0.4", default-features = false, features = ["tls-native"] }
+```
+
+Exactly one TLS feature must be enabled:
+
+- `tls-rustls-ring` (default)
+- `tls-rustls-aws-lc`
+- `tls-native`
+
 ## Supported Services
 
 | Service | Client | Operations |

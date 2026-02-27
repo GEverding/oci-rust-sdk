@@ -33,6 +33,22 @@
 //! }
 //! ```
 
+#[cfg(not(any(
+    feature = "tls-rustls-ring",
+    feature = "tls-rustls-aws-lc",
+    feature = "tls-native"
+)))]
+compile_error!(
+    "Enable one TLS backend feature: tls-rustls-ring, tls-rustls-aws-lc, or tls-native."
+);
+
+#[cfg(any(
+    all(feature = "tls-rustls-ring", feature = "tls-rustls-aws-lc"),
+    all(feature = "tls-rustls-ring", feature = "tls-native"),
+    all(feature = "tls-rustls-aws-lc", feature = "tls-native")
+))]
+compile_error!("Enable exactly one TLS backend feature.");
+
 pub mod auth;
 pub mod config;
 pub mod dataflow;
