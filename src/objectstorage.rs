@@ -27,7 +27,7 @@
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let auth = ConfigFileAuth::from_file(None, None)?;
-//! let client = ObjectStorageClient::new(auth, "my-namespace", None).await?;
+//! let client = ObjectStorageClient::new(auth, "my-namespace", None, None).await?;
 //!
 //! let request = ListObjectsRequest {
 //!     prefix: Some("data/"),
@@ -42,7 +42,7 @@
 //! # }
 //! ```
 
-use crate::auth::{encode_body, AuthProvider};
+use crate::auth::{encode_body, resolve_endpoint, AuthProvider};
 use chrono::Utc;
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -573,16 +573,20 @@ impl<A: AuthProvider> ObjectStorageClient<A> {
     ///
     /// Pool defaults: 64 idle connections per host, 90 s idle timeout, 60 s TCP keepalive,
     /// 30 s request timeout. If `region` is `None`, it is resolved from `auth`.
+    /// If `service_endpoint` is provided, it takes precedence over `region`.
     pub async fn new(
         auth: A,
         namespace: impl Into<String>,
         region: Option<&str>,
+        service_endpoint: Option<&str>,
     ) -> Result<Self, ObjectStorageError> {
-        let region = match region {
-            Some(r) => r.to_string(),
-            None => auth.get_region().await?,
-        };
-        let service_endpoint = format!("https://objectstorage.{}.oraclecloud.com", region);
+        let endpoint = resolve_endpoint(
+            &auth,
+            "https://objectstorage.{region}.oraclecloud.com",
+            region,
+            service_endpoint,
+        )
+        .await?;
         let client = reqwest::Client::builder()
             .pool_max_idle_per_host(64)
             .pool_idle_timeout(Duration::from_secs(90))
@@ -593,29 +597,33 @@ impl<A: AuthProvider> ObjectStorageClient<A> {
             auth,
             client,
             namespace: namespace.into(),
-            service_endpoint,
+            service_endpoint: endpoint,
         })
     }
 
     /// Create a client with a caller-supplied `reqwest::Client` for custom pool tuning.
     ///
     /// Use this when you need to share a client across services or configure TLS/proxy settings.
+    /// If `service_endpoint` is provided, it takes precedence over `region`.
     pub async fn with_client(
         auth: A,
         namespace: impl Into<String>,
         region: Option<&str>,
+        service_endpoint: Option<&str>,
         client: reqwest::Client,
     ) -> Result<Self, ObjectStorageError> {
-        let region = match region {
-            Some(r) => r.to_string(),
-            None => auth.get_region().await?,
-        };
-        let service_endpoint = format!("https://objectstorage.{}.oraclecloud.com", region);
+        let endpoint = resolve_endpoint(
+            &auth,
+            "https://objectstorage.{region}.oraclecloud.com",
+            region,
+            service_endpoint,
+        )
+        .await?;
         Ok(Self {
             auth,
             client,
             namespace: namespace.into(),
-            service_endpoint,
+            service_endpoint: endpoint,
         })
     }
 

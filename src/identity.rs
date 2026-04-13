@@ -7,7 +7,7 @@ use chrono::Utc;
 use reqwest::{header::HeaderMap, Response};
 use std::sync::Arc;
 
-use crate::auth::{AuthError, AuthProvider};
+use crate::auth::{resolve_endpoint, AuthError, AuthProvider};
 
 /// Client for the OCI Identity service
 pub struct Identity {
@@ -21,6 +21,7 @@ impl Identity {
     ///
     /// # Arguments
     /// * `auth` - Authentication provider (ConfigFileAuth, InstancePrincipalAuth, etc.)
+    /// * `region` - Optional region override. If None, uses auth.get_region().
     /// * `service_endpoint` - Optional custom endpoint. If None, uses the standard endpoint for the region.
     ///
     /// # Example
@@ -32,17 +33,22 @@ impl Identity {
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ///     let auth = Arc::new(ConfigFileAuth::from_file(None, None)?);
-    ///     let identity = Identity::new(auth, None).await?;
+    ///     let identity = Identity::new(auth, None, None).await?;
     ///     Ok(())
     /// }
     /// ```
     pub async fn new(
         auth: Arc<dyn AuthProvider>,
-        service_endpoint: Option<String>,
+        region: Option<&str>,
+        service_endpoint: Option<&str>,
     ) -> Result<Self, AuthError> {
-        let region = auth.get_region().await?;
-        let endpoint = service_endpoint
-            .unwrap_or_else(|| format!("https://identity.{}.oci.oraclecloud.com", region));
+        let endpoint = resolve_endpoint(
+            auth.as_ref(),
+            "https://identity.{region}.oci.oraclecloud.com",
+            region,
+            service_endpoint,
+        )
+        .await?;
 
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))

@@ -70,6 +70,13 @@ pub trait AuthProvider: Send + Sync {
     /// Invalidate cached credentials, forcing re-authentication on the next request.
     /// Default is a no-op (e.g., API key auth never expires).
     async fn invalidate_credentials(&self) {}
+
+    /// Returns true if this auth provider issues region-scoped tokens.
+    /// Region-scoped providers (instance principal, workload identity) cannot
+    /// authenticate against services in a different region.
+    fn is_region_scoped(&self) -> bool {
+        false // default: not region-scoped (safe for API key, config file)
+    }
 }
 
 /// Compute SHA256 hash of body and return base64-encoded result
@@ -211,6 +218,148 @@ fn normalize_region(region: &str) -> String {
         other => return other.to_string(),
     }
     .to_string()
+}
+
+/// Extracts the OCI region from a service endpoint URL.
+/// Returns None if the URL doesn't match known OCI endpoint patterns.
+///
+/// # Examples
+/// - `https://objectstorage.us-ashburn-1.oraclecloud.com` → `Some("us-ashburn-1")`
+/// - `https://identity.us-ashburn-1.oci.oraclecloud.com` → `Some("us-ashburn-1")`
+/// - `https://cell-1.queue.messaging.us-phoenix-1.oci.oraclecloud.com` → `Some("us-phoenix-1")`
+/// - `https://localhost:8080` → `None`
+#[must_use]
+pub fn extract_region_from_endpoint(endpoint: &str) -> Option<String> {
+    // Parse the URL to get the hostname
+    let url = reqwest::Url::parse(endpoint).ok()?;
+    let hostname = url.host_str()?;
+
+    // Split hostname by '.'
+    let parts: Vec<&str> = hostname.split('.').collect();
+
+    // Look for "oraclecloud" in the parts
+    let oraclecloud_idx = parts.iter().position(|&p| p == "oraclecloud")?;
+
+    // The region is the segment immediately before "oraclecloud"
+    if oraclecloud_idx == 0 {
+        return None; // "oraclecloud" is the first part, no region before it
+    }
+
+    let region_idx = oraclecloud_idx - 1;
+    let potential_region = parts[region_idx];
+
+    // If the segment before "oraclecloud" is "oci", the region is one more segment back
+    let region = if potential_region == "oci" {
+        if region_idx == 0 {
+            return None; // "oci" is the first part, no region before it
+        }
+        parts[region_idx - 1]
+    } else {
+        potential_region
+    };
+
+    // Run through normalize_region for consistency
+    Some(normalize_region(region))
+}
+
+/// Warns if a region-scoped auth provider is being used with a cross-region endpoint.
+/// Call this from client constructors when a service_endpoint override is provided.
+///
+/// # Arguments
+/// * `auth` - The authentication provider
+/// * `auth_region` - The region from the auth provider (already resolved)
+/// * `service_endpoint` - The service endpoint URL being used
+pub fn warn_cross_region(auth: &dyn AuthProvider, auth_region: &str, service_endpoint: &str) {
+    if !auth.is_region_scoped() {
+        return;
+    }
+    if let Some(endpoint_region) = extract_region_from_endpoint(service_endpoint) {
+        let normalized_auth = normalize_region(auth_region);
+        if normalized_auth != endpoint_region {
+            warn!(
+                auth_region = %normalized_auth,
+                endpoint_region = %endpoint_region,
+                service_endpoint = %service_endpoint,
+                "Cross-region request with region-scoped auth provider. \
+                 Security tokens from workload identity and instance principal \
+                 are region-bound and will be rejected by services in other regions."
+            );
+        }
+    }
+}
+
+/// Resolves the service endpoint for a client.
+///
+/// This function implements the standard endpoint resolution pattern for all OCI SDK clients.
+/// It follows a priority order to determine which endpoint to use:
+///
+/// 1. **`service_endpoint`** — if provided, use as-is (escape hatch for custom/private endpoints)
+/// 2. **`region`** — if provided, interpolate into the URL template
+/// 3. **`auth.get_region()`** — default fallback to the auth provider's region
+///
+/// After resolution, calls [`warn_cross_region`] if the auth provider is region-scoped and
+/// the resolved endpoint is in a different region.
+///
+/// # Arguments
+/// * `auth` - The authentication provider
+/// * `url_template` - The URL template with `{region}` placeholder (e.g., `"https://objectstorage.{region}.oraclecloud.com"`)
+/// * `region` - Optional region override
+/// * `service_endpoint` - Optional service endpoint override (takes precedence)
+///
+/// # Returns
+/// The resolved endpoint URL as a `String`.
+///
+/// # Errors
+/// Returns `AuthError` if `auth.get_region()` fails and neither `region` nor `service_endpoint` are provided.
+///
+/// # Example
+/// ```no_run
+/// use oci_sdk::auth::{resolve_endpoint, ConfigFileAuth};
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let auth = ConfigFileAuth::from_file(None, None)?;
+/// let endpoint = resolve_endpoint(
+///     &auth,
+///     "https://objectstorage.{region}.oraclecloud.com",
+///     None,
+///     None,
+/// ).await?;
+/// println!("Using endpoint: {}", endpoint);
+/// # Ok(())
+/// # }
+/// ```
+#[instrument(skip(auth))]
+pub async fn resolve_endpoint(
+    auth: &dyn AuthProvider,
+    url_template: &str,
+    region: Option<&str>,
+    service_endpoint: Option<&str>,
+) -> Result<String, AuthError> {
+    // Priority 1: explicit service_endpoint override
+    if let Some(endpoint) = service_endpoint {
+        // Still warn about cross-region even with explicit endpoint
+        if let Ok(auth_region) = auth.get_region().await {
+            warn_cross_region(auth, &auth_region, endpoint);
+        }
+        return Ok(endpoint.to_string());
+    }
+
+    // Priority 2: explicit region override, or fall back to auth.get_region()
+    let resolved_region = match region {
+        Some(r) => normalize_region(r).to_string(),
+        None => auth.get_region().await?,
+    };
+
+    let endpoint = url_template.replace("{region}", &resolved_region);
+
+    // Warn if explicit region override differs from auth region
+    if region.is_some() {
+        if let Ok(auth_region) = auth.get_region().await {
+            warn_cross_region(auth, &auth_region, &endpoint);
+        }
+    }
+
+    Ok(endpoint)
 }
 
 // ============================================================================
@@ -1055,6 +1204,10 @@ impl AuthProvider for InstancePrincipalAuth {
     async fn invalidate_credentials(&self) {
         *self.credentials.write().await = None;
     }
+
+    fn is_region_scoped(&self) -> bool {
+        true
+    }
 }
 
 // ============================================================================
@@ -1449,6 +1602,10 @@ impl AuthProvider for OkeWorkloadIdentityAuth {
     async fn invalidate_credentials(&self) {
         *self.credentials.write().await = None;
     }
+
+    fn is_region_scoped(&self) -> bool {
+        true
+    }
 }
 
 /// Builder for OkeWorkloadIdentityAuth
@@ -1568,5 +1725,400 @@ mod tests {
     fn test_config_file_auth_missing_file() {
         let result = ConfigFileAuth::from_file(Some("/nonexistent/path/config".to_string()), None);
         assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // extract_region_from_endpoint tests
+    // =========================================================================
+
+    #[test]
+    fn test_extract_region_objectstorage_returns_us_ashburn_1() {
+        let result =
+            extract_region_from_endpoint("https://objectstorage.us-ashburn-1.oraclecloud.com");
+        assert_eq!(result, Some("us-ashburn-1".to_string()));
+    }
+
+    #[test]
+    fn test_extract_region_identity_oci_subdomain_returns_us_ashburn_1() {
+        let result =
+            extract_region_from_endpoint("https://identity.us-ashburn-1.oci.oraclecloud.com");
+        assert_eq!(result, Some("us-ashburn-1".to_string()));
+    }
+
+    #[test]
+    fn test_extract_region_queue_cell_prefix_returns_us_phoenix_1() {
+        let result = extract_region_from_endpoint(
+            "https://cell-1.queue.messaging.us-phoenix-1.oci.oraclecloud.com",
+        );
+        assert_eq!(result, Some("us-phoenix-1".to_string()));
+    }
+
+    #[test]
+    fn test_extract_region_secrets_vaults_returns_eu_frankfurt_1() {
+        let result = extract_region_from_endpoint(
+            "https://secrets.vaults.eu-frankfurt-1.oci.oraclecloud.com",
+        );
+        assert_eq!(result, Some("eu-frankfurt-1".to_string()));
+    }
+
+    #[test]
+    fn test_extract_region_nosql_returns_ap_tokyo_1() {
+        let result = extract_region_from_endpoint("https://nosql.ap-tokyo-1.oci.oraclecloud.com");
+        assert_eq!(result, Some("ap-tokyo-1".to_string()));
+    }
+
+    #[test]
+    fn test_extract_region_short_code_iad_normalizes_to_us_ashburn_1() {
+        // Short region code "iad" should be normalized to "us-ashburn-1"
+        let result = extract_region_from_endpoint("https://objectstorage.iad.oraclecloud.com");
+        assert_eq!(result, Some("us-ashburn-1".to_string()));
+    }
+
+    #[test]
+    fn test_extract_region_short_code_phx_normalizes_to_us_phoenix_1() {
+        let result = extract_region_from_endpoint("https://objectstorage.phx.oraclecloud.com");
+        assert_eq!(result, Some("us-phoenix-1".to_string()));
+    }
+
+    #[test]
+    fn test_extract_region_localhost_returns_none() {
+        let result = extract_region_from_endpoint("https://localhost:8080");
+        assert_eq!(
+            result, None,
+            "localhost should not match OCI endpoint pattern"
+        );
+    }
+
+    #[test]
+    fn test_extract_region_custom_endpoint_returns_none() {
+        let result = extract_region_from_endpoint("https://custom.endpoint.com");
+        assert_eq!(result, None, "non-OCI endpoint should return None");
+    }
+
+    #[test]
+    fn test_extract_region_empty_string_returns_none() {
+        let result = extract_region_from_endpoint("");
+        assert_eq!(
+            result, None,
+            "empty string should not panic and should return None"
+        );
+    }
+
+    #[test]
+    fn test_extract_region_garbage_input_returns_none() {
+        let result = extract_region_from_endpoint("not-a-url-at-all!!!");
+        assert_eq!(
+            result, None,
+            "garbage input should not panic and should return None"
+        );
+    }
+
+    #[test]
+    fn test_extract_region_plain_oraclecloud_no_region_returns_none() {
+        // "oraclecloud.com" with no region segment before it
+        let result = extract_region_from_endpoint("https://oraclecloud.com");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_region_various_services() {
+        let cases = [
+            (
+                "https://dataflow.us-ashburn-1.oci.oraclecloud.com",
+                Some("us-ashburn-1"),
+            ),
+            (
+                "https://streaming.ap-tokyo-1.oci.oraclecloud.com",
+                Some("ap-tokyo-1"),
+            ),
+            (
+                "https://objectstorage.eu-frankfurt-1.oraclecloud.com",
+                Some("eu-frankfurt-1"),
+            ),
+            (
+                "https://auth.us-phoenix-1.oraclecloud.com",
+                Some("us-phoenix-1"),
+            ),
+        ];
+        for (endpoint, expected) in cases {
+            let result = extract_region_from_endpoint(endpoint);
+            assert_eq!(
+                result.as_deref(),
+                expected,
+                "Failed for endpoint: {endpoint}"
+            );
+        }
+    }
+
+    // =========================================================================
+    // is_region_scoped tests
+    // =========================================================================
+
+    /// Minimal test AuthProvider that uses the default trait implementation.
+    struct DefaultScopedAuth;
+
+    #[async_trait::async_trait]
+    impl AuthProvider for DefaultScopedAuth {
+        async fn sign_request(
+            &self,
+            _headers: &mut reqwest::header::HeaderMap,
+            _method: &str,
+            _path: &str,
+            _host: &str,
+        ) -> Result<(), AuthError> {
+            Ok(())
+        }
+
+        async fn get_tenancy_id(&self) -> Result<String, AuthError> {
+            Ok("ocid1.tenancy.oc1..test".to_string())
+        }
+
+        async fn get_region(&self) -> Result<String, AuthError> {
+            Ok("us-ashburn-1".to_string())
+        }
+    }
+
+    /// Test AuthProvider that overrides is_region_scoped to return true.
+    struct RegionScopedAuth;
+
+    #[async_trait::async_trait]
+    impl AuthProvider for RegionScopedAuth {
+        async fn sign_request(
+            &self,
+            _headers: &mut reqwest::header::HeaderMap,
+            _method: &str,
+            _path: &str,
+            _host: &str,
+        ) -> Result<(), AuthError> {
+            Ok(())
+        }
+
+        async fn get_tenancy_id(&self) -> Result<String, AuthError> {
+            Ok("ocid1.tenancy.oc1..test".to_string())
+        }
+
+        async fn get_region(&self) -> Result<String, AuthError> {
+            Ok("us-ashburn-1".to_string())
+        }
+
+        fn is_region_scoped(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_is_region_scoped_default_returns_false() {
+        let auth = DefaultScopedAuth;
+        assert!(
+            !auth.is_region_scoped(),
+            "Default trait implementation should return false"
+        );
+    }
+
+    #[test]
+    fn test_is_region_scoped_override_returns_true() {
+        let auth = RegionScopedAuth;
+        assert!(
+            auth.is_region_scoped(),
+            "Overridden is_region_scoped should return true"
+        );
+    }
+
+    #[test]
+    fn test_is_region_scoped_instance_principal_returns_true() {
+        let auth = InstancePrincipalAuth::new(Some("us-ashburn-1".to_string()));
+        assert!(
+            auth.is_region_scoped(),
+            "InstancePrincipalAuth must be region-scoped"
+        );
+    }
+
+    #[test]
+    fn test_is_region_scoped_config_file_auth_returns_false() {
+        // ConfigFileAuth uses the default (false) — API key auth is not region-scoped
+        let auth = DefaultScopedAuth; // same semantics as ConfigFileAuth
+        assert!(!auth.is_region_scoped());
+    }
+
+    // =========================================================================
+    // warn_cross_region tests
+    // =========================================================================
+
+    #[test]
+    fn test_warn_cross_region_non_scoped_auth_does_not_panic() {
+        // Non-region-scoped auth: function should return early without panicking
+        let auth = DefaultScopedAuth;
+        warn_cross_region(
+            &auth,
+            "us-ashburn-1",
+            "https://objectstorage.eu-frankfurt-1.oraclecloud.com",
+        );
+    }
+
+    #[test]
+    fn test_warn_cross_region_same_region_does_not_panic() {
+        // Region-scoped auth, same region: no warning, no panic
+        let auth = RegionScopedAuth;
+        warn_cross_region(
+            &auth,
+            "us-ashburn-1",
+            "https://objectstorage.us-ashburn-1.oraclecloud.com",
+        );
+    }
+
+    #[test]
+    fn test_warn_cross_region_different_region_does_not_panic() {
+        // Region-scoped auth, different region: should emit warning but not panic
+        let auth = RegionScopedAuth;
+        warn_cross_region(
+            &auth,
+            "us-ashburn-1",
+            "https://objectstorage.eu-frankfurt-1.oraclecloud.com",
+        );
+    }
+
+    #[test]
+    fn test_warn_cross_region_non_oci_endpoint_does_not_panic() {
+        // Region-scoped auth, non-OCI endpoint (extract_region returns None): no warning, no panic
+        let auth = RegionScopedAuth;
+        warn_cross_region(&auth, "us-ashburn-1", "https://localhost:8080");
+    }
+
+    #[test]
+    fn test_warn_cross_region_empty_strings_does_not_panic() {
+        let auth = RegionScopedAuth;
+        warn_cross_region(&auth, "", "");
+    }
+
+    #[test]
+    fn test_warn_cross_region_garbage_endpoint_does_not_panic() {
+        let auth = RegionScopedAuth;
+        warn_cross_region(&auth, "us-ashburn-1", "not-a-url!!!");
+    }
+
+    #[test]
+    fn test_warn_cross_region_short_code_auth_region_normalized() {
+        // auth_region "iad" should normalize to "us-ashburn-1" and match the endpoint
+        let auth = RegionScopedAuth;
+        // Same region via short code — should NOT warn (no panic either way)
+        warn_cross_region(
+            &auth,
+            "iad",
+            "https://objectstorage.us-ashburn-1.oraclecloud.com",
+        );
+    }
+
+    #[test]
+    fn test_warn_cross_region_short_code_cross_region_does_not_panic() {
+        // auth_region "iad" (us-ashburn-1) vs endpoint in us-phoenix-1 — cross-region warning
+        let auth = RegionScopedAuth;
+        warn_cross_region(
+            &auth,
+            "iad",
+            "https://objectstorage.us-phoenix-1.oraclecloud.com",
+        );
+    }
+
+    // =========================================================================
+    // resolve_endpoint tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_resolve_endpoint_explicit_service_endpoint_takes_precedence() {
+        let auth = DefaultScopedAuth;
+        let result = resolve_endpoint(
+            &auth,
+            "https://objectstorage.{region}.oraclecloud.com",
+            Some("us-phoenix-1"),
+            Some("https://custom.endpoint.com"),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "https://custom.endpoint.com");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_endpoint_explicit_region_overrides_auth() {
+        let auth = DefaultScopedAuth;
+        let result = resolve_endpoint(
+            &auth,
+            "https://objectstorage.{region}.oraclecloud.com",
+            Some("eu-frankfurt-1"),
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            "https://objectstorage.eu-frankfurt-1.oraclecloud.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_endpoint_falls_back_to_auth_region() {
+        let auth = DefaultScopedAuth;
+        let result = resolve_endpoint(
+            &auth,
+            "https://objectstorage.{region}.oraclecloud.com",
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            "https://objectstorage.us-ashburn-1.oraclecloud.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_endpoint_normalizes_short_region_code() {
+        let auth = DefaultScopedAuth;
+        let result = resolve_endpoint(
+            &auth,
+            "https://objectstorage.{region}.oraclecloud.com",
+            Some("iad"),
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            "https://objectstorage.us-ashburn-1.oraclecloud.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_endpoint_with_different_url_template() {
+        let auth = DefaultScopedAuth;
+        let result = resolve_endpoint(
+            &auth,
+            "https://identity.{region}.oci.oraclecloud.com",
+            Some("ap-tokyo-1"),
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            "https://identity.ap-tokyo-1.oci.oraclecloud.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_endpoint_service_endpoint_none_region_none_uses_auth() {
+        let auth = DefaultScopedAuth;
+        let result = resolve_endpoint(
+            &auth,
+            "https://queue.messaging.{region}.oci.oraclecloud.com",
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            "https://queue.messaging.us-ashburn-1.oci.oraclecloud.com"
+        );
     }
 }

@@ -9,7 +9,7 @@ mod tests {
             Some("tests/assets/oci_config".to_string()),
             None,
         )?);
-        let identity = Identity::new(auth, Some("http://localhost:12000".to_string())).await?;
+        let identity = Identity::new(auth, None, Some("http://localhost:12000")).await?;
 
         let response = identity.get_current_user().await?;
         let body = response.text().await?;
@@ -25,7 +25,7 @@ mod tests {
             Some("tests/assets/oci_config".to_string()),
             None,
         )?);
-        let identity = Identity::new(auth, Some("http://localhost:12000".to_string())).await?;
+        let identity = Identity::new(auth, None, Some("http://localhost:12000")).await?;
 
         let response = identity
             .get_user(
@@ -45,7 +45,7 @@ mod tests {
             Some("tests/assets/oci_config".to_string()),
             None,
         )?);
-        let identity = Identity::new(auth, Some("http://localhost:12000".to_string())).await?;
+        let identity = Identity::new(auth, None, Some("http://localhost:12000")).await?;
 
         let response = identity
             .list_users(

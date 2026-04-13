@@ -12,7 +12,7 @@ mod tests {
             Some("tests/assets/oci_config".to_string()),
             None,
         )?);
-        let nosql = Nosql::new(auth, Some("http://localhost:12000".to_string())).await?;
+        let nosql = Nosql::new(auth, None, Some("http://localhost:12000")).await?;
 
         let table_limits = TableLimits {
             max_read_units: 1,

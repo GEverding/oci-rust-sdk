@@ -117,7 +117,7 @@ use oci_sdk::auth::ConfigFileAuth;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth = ConfigFileAuth::from_file(None, None)?;
-    let client = ObjectStorageClient::new(auth, "my-namespace", None).await?;
+    let client = ObjectStorageClient::new(auth, "my-namespace", None, None).await?;
 
     // List objects with prefix
     let request = ListObjectsRequest {
@@ -256,7 +256,7 @@ let http_client = reqwest::Client::builder()
     .tcp_keepalive(Duration::from_secs(60))
     .build()?;
 
-let client = ObjectStorageClient::with_client(auth, "namespace", None, http_client).await?;
+let client = ObjectStorageClient::with_client(auth, "namespace", None, None, http_client).await?;
 ```
 
 > **Note:** `put_object` requires the full object body in memory to compute the `x-content-sha256` header required by OCI. For objects larger than ~100MB, multipart upload is recommended (not yet implemented).

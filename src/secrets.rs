@@ -2,7 +2,7 @@
 //!
 //! Simple client for retrieving secrets from OCI Vault.
 
-use crate::auth::{AuthError, AuthProvider};
+use crate::auth::{resolve_endpoint, AuthError, AuthProvider};
 use chrono::Utc;
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
@@ -57,7 +57,7 @@ impl SecretBundle {
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///     let auth = Arc::new(InstancePrincipalAuth::new(None));
-///     let secrets = SecretsClient::new(auth, None).await?;
+///     let secrets = SecretsClient::new(auth, None, None).await?;
 ///
 ///     let secret = secrets.get_secret("ocid1.vaultsecret.oc1..xxx").await?;
 ///     println!("Secret value: {}", secret.decode_content()?);
@@ -74,11 +74,16 @@ impl SecretsClient {
     /// Create a new Secrets client
     pub async fn new(
         auth: Arc<dyn AuthProvider>,
-        service_endpoint: Option<String>,
+        region: Option<&str>,
+        service_endpoint: Option<&str>,
     ) -> Result<Self, AuthError> {
-        let region = auth.get_region().await?;
-        let endpoint = service_endpoint
-            .unwrap_or_else(|| format!("https://secrets.vaults.{}.oci.oraclecloud.com", region));
+        let endpoint = resolve_endpoint(
+            auth.as_ref(),
+            "https://secrets.vaults.{region}.oci.oraclecloud.com",
+            region,
+            service_endpoint,
+        )
+        .await?;
 
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))

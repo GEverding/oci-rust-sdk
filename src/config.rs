@@ -19,7 +19,7 @@ pub use crate::auth::ConfigFileAuth;
 /// ```ignore
 /// use std::sync::Arc;
 /// let auth = Arc::new(ConfigFileAuth::from_file(None, None)?);
-/// let identity = Identity::new(auth, None).await?;
+/// let identity = Identity::new(auth, None, None).await?;
 /// ```
 #[deprecated(
     since = "0.4.0",

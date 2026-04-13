@@ -3,7 +3,7 @@
 //! This module provides a client for interacting with OCI's Queue service,
 //! enabling message-based communication between distributed applications.
 
-use crate::auth::{encode_body, AuthError, AuthProvider};
+use crate::auth::{encode_body, resolve_endpoint, AuthError, AuthProvider};
 use chrono::Utc;
 use reqwest::header::HeaderMap;
 use reqwest::Response;
@@ -223,6 +223,7 @@ pub struct QueueStats {
 ///         auth,
 ///         "ocid1.queue.oc1..example",
 ///         None,
+///         None,
 ///     ).await?;
 ///
 ///     // Send a message
@@ -244,22 +245,25 @@ impl QueueClient {
     /// # Arguments
     /// * `auth` - Authentication provider
     /// * `queue_id` - The OCID of the queue
+    /// * `region` - Optional region override. If None, uses auth.get_region().
     /// * `service_endpoint` - Optional custom endpoint. If None, uses the standard endpoint.
     pub async fn new(
         auth: Arc<dyn AuthProvider>,
         queue_id: impl Into<String>,
+        region: Option<&str>,
         service_endpoint: Option<String>,
     ) -> Result<Self, QueueError> {
-        let region = auth.get_region().await?;
         let queue_id = queue_id.into();
 
         // Queue service uses a different endpoint pattern
-        let endpoint = service_endpoint.unwrap_or_else(|| {
-            format!(
-                "https://cell-1.queue.messaging.{}.oci.oraclecloud.com",
-                region
-            )
-        });
+        let url_template = "https://cell-1.queue.messaging.{region}.oci.oraclecloud.com";
+        let endpoint = resolve_endpoint(
+            auth.as_ref(),
+            url_template,
+            region,
+            service_endpoint.as_deref(),
+        )
+        .await?;
 
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
@@ -522,6 +526,10 @@ impl QueueClient {
                 .map_err(|_| QueueError::HeaderParseError("x-content-sha256 header".to_string()))?,
         );
 
+        self.auth
+            .sign_request(&mut headers, "put", &path, &self.service_endpoint)
+            .await?;
+
         let response = self
             .http_client
             .put(format!("{}{}", self.service_endpoint, path))
@@ -685,6 +693,9 @@ impl QueueClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn test_queue_message_serialization() {
@@ -695,5 +706,170 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("test"));
         assert!(json.contains("key"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Mock auth provider — records that sign_request was called and injects a
+    // fake Authorization header so we can assert it reaches the wire.
+    // ---------------------------------------------------------------------------
+    struct MockAuthProvider {
+        sign_called: Arc<AtomicBool>,
+    }
+
+    impl MockAuthProvider {
+        fn new() -> (Arc<AtomicBool>, Arc<Self>) {
+            let flag = Arc::new(AtomicBool::new(false));
+            let provider = Arc::new(Self {
+                sign_called: Arc::clone(&flag),
+            });
+            (flag, provider)
+        }
+    }
+
+    #[async_trait]
+    impl AuthProvider for MockAuthProvider {
+        async fn sign_request(
+            &self,
+            headers: &mut reqwest::header::HeaderMap,
+            _method: &str,
+            _path: &str,
+            _host: &str,
+        ) -> Result<(), crate::auth::AuthError> {
+            self.sign_called.store(true, Ordering::SeqCst);
+            headers.insert(
+                "authorization",
+                "Signature algorithm=\"rsa-sha256\",headers=\"date (request-target) host\",keyId=\"mock/key/id\",signature=\"bW9jaw==\",version=\"1\""
+                    .parse()
+                    .expect("static header value is valid"),
+            );
+            Ok(())
+        }
+
+        async fn get_tenancy_id(&self) -> Result<String, crate::auth::AuthError> {
+            Ok("ocid1.tenancy.oc1..mock".to_string())
+        }
+
+        async fn get_region(&self) -> Result<String, crate::auth::AuthError> {
+            Ok("us-ashburn-1".to_string())
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Minimal HTTP/1.1 server that accepts one request, captures the raw bytes,
+    // and responds with a 200 OK so reqwest doesn't error out.
+    // ---------------------------------------------------------------------------
+    async fn spawn_capture_server() -> (u16, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind to loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.expect("read");
+            let request_text = String::from_utf8_lossy(&buf[..n]).to_string();
+
+            // Send a minimal HTTP 200 response so reqwest doesn't error
+            let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+
+            let _ = tx.send(request_text);
+        });
+
+        (port, rx)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test: update_message() must call sign_request() and include an
+    // Authorization header with the Signature scheme in the outgoing request.
+    // ---------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_update_message_includes_authorization_header() {
+        let (port, rx) = spawn_capture_server().await;
+        let endpoint = format!("http://127.0.0.1:{}", port);
+
+        let (sign_called, mock_auth) = MockAuthProvider::new();
+
+        let client = QueueClient::with_endpoint(mock_auth, "ocid1.queue.oc1..testqueue", endpoint);
+
+        // update_message will fail at the HTTP layer (empty body / no JSON) but
+        // sign_request must have been called before the request is sent.
+        let _ = client.update_message("test-receipt-token", 30).await;
+
+        // 1. sign_request was invoked
+        assert!(
+            sign_called.load(Ordering::SeqCst),
+            "sign_request() was never called — Authorization header would be missing"
+        );
+
+        // 2. The raw HTTP request captured by the server contains the Authorization header
+        let raw_request = rx.await.expect("server captured a request");
+        assert!(
+            raw_request.to_lowercase().contains("authorization:"),
+            "Authorization header not found in outgoing request.\nRequest was:\n{}",
+            raw_request
+        );
+
+        // 3. The Authorization value uses the Signature scheme (OCI HTTP signing)
+        assert!(
+            raw_request.contains("Signature "),
+            "Authorization header does not use the Signature scheme.\nRequest was:\n{}",
+            raw_request
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression guard: a MockAuthProvider that does NOT insert Authorization
+    // lets us confirm the header is absent when sign_request is skipped —
+    // proving the test above is actually sensitive to the regression.
+    // ---------------------------------------------------------------------------
+    struct NoOpAuthProvider;
+
+    #[async_trait]
+    impl AuthProvider for NoOpAuthProvider {
+        async fn sign_request(
+            &self,
+            _headers: &mut reqwest::header::HeaderMap,
+            _method: &str,
+            _path: &str,
+            _host: &str,
+        ) -> Result<(), crate::auth::AuthError> {
+            // Intentionally does NOT insert Authorization — simulates the pre-fix bug
+            Ok(())
+        }
+
+        async fn get_tenancy_id(&self) -> Result<String, crate::auth::AuthError> {
+            Ok("ocid1.tenancy.oc1..mock".to_string())
+        }
+
+        async fn get_region(&self) -> Result<String, crate::auth::AuthError> {
+            Ok("us-ashburn-1".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_message_without_signing_has_no_authorization_header() {
+        let (port, rx) = spawn_capture_server().await;
+        let endpoint = format!("http://127.0.0.1:{}", port);
+
+        let client = QueueClient::with_endpoint(
+            Arc::new(NoOpAuthProvider),
+            "ocid1.queue.oc1..testqueue",
+            endpoint,
+        );
+
+        let _ = client.update_message("test-receipt-token", 30).await;
+
+        let raw_request = rx.await.expect("server captured a request");
+        assert!(
+            !raw_request.to_lowercase().contains("authorization:"),
+            "Expected no Authorization header when sign_request is a no-op, but found one.\nRequest:\n{}",
+            raw_request
+        );
     }
 }

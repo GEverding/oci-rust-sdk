@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let region = "us-ashburn-1";
 
     println!("Creating DataFlow client with ConfigFileAuth...");
-    let client = DataFlowClient::new(auth, region);
+    let client = DataFlowClient::new(auth, Some(region), None).await?;
 
     // Create a run
     let run_details =

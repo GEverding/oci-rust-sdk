@@ -1,4 +1,4 @@
-use crate::auth::{encode_body, AuthProvider};
+use crate::auth::{encode_body, resolve_endpoint, AuthError, AuthProvider};
 use chrono::Utc;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -112,7 +112,7 @@ pub struct ListRunsParams {
 #[derive(Debug, thiserror::Error)]
 pub enum DataFlowError {
     #[error("Authentication error: {0}")]
-    AuthError(#[from] crate::auth::AuthError),
+    AuthError(#[from] AuthError),
     #[error("HTTP error: {0}")]
     HttpError(#[from] reqwest::Error),
     #[error("API error (status {status}): {message}")]
@@ -127,7 +127,7 @@ pub enum DataFlowError {
 pub struct DataFlowClient<A: AuthProvider> {
     auth: A,
     client: reqwest::Client,
-    region: String,
+    base_url: String,
 }
 
 impl<A: AuthProvider> DataFlowClient<A> {
@@ -135,25 +135,25 @@ impl<A: AuthProvider> DataFlowClient<A> {
     ///
     /// # Arguments
     /// * `auth` - Authentication provider
-    /// * `region` - OCI region
-    pub fn new(auth: A, region: impl Into<String>) -> Self {
-        Self {
+    /// * `region` - Optional OCI region (falls back to auth.get_region() if not provided)
+    /// * `service_endpoint` - Optional explicit service endpoint override
+    pub async fn new(
+        auth: A,
+        region: Option<&str>,
+        service_endpoint: Option<&str>,
+    ) -> Result<Self, DataFlowError> {
+        let url_template = "https://dataflow.{region}.oci.oraclecloud.com/20200129";
+        let base_url = resolve_endpoint(&auth, url_template, region, service_endpoint).await?;
+
+        Ok(Self {
             auth,
             client: reqwest::Client::new(),
-            region: region.into(),
-        }
-    }
-
-    fn service_host(&self) -> String {
-        format!("dataflow.{}.oci.oraclecloud.com", self.region)
+            base_url,
+        })
     }
 
     fn api_version(&self) -> &str {
         "/20200129"
-    }
-
-    fn base_url(&self) -> String {
-        format!("https://{}{}", self.service_host(), self.api_version())
     }
 
     fn create_date_header() -> String {
@@ -202,11 +202,11 @@ impl<A: AuthProvider> DataFlowClient<A> {
         // Sign the request with full path including API version
         let full_path = format!("{}{}", self.api_version(), path);
         self.auth
-            .sign_request(&mut headers, method, &full_path, &self.base_url())
+            .sign_request(&mut headers, method, &full_path, &self.base_url)
             .await?;
 
         // Build and send the request
-        let url = format!("{}{}", self.base_url(), path);
+        let url = format!("{}{}", self.base_url, path);
         let mut request_builder = match method {
             "get" => self.client.get(&url),
             "post" => self.client.post(&url),

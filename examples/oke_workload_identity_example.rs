@@ -51,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Creating Queue client with OKE Workload Identity auth...");
 
     // Create Queue client
-    let queue = QueueClient::new(auth.clone(), &queue_id, None).await?;
+    let queue = QueueClient::new(auth.clone(), &queue_id, None, None).await?;
 
     // Send a test message
     println!("Sending test message from Kubernetes pod...");

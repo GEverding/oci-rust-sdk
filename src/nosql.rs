@@ -2,7 +2,7 @@
 //!
 //! This module provides a client for interacting with OCI's NoSQL Database service.
 
-use crate::auth::{encode_body, AuthError, AuthProvider};
+use crate::auth::{encode_body, resolve_endpoint, AuthError, AuthProvider};
 use chrono::Utc;
 use reqwest::header::HeaderMap;
 use reqwest::Response;
@@ -48,6 +48,7 @@ impl Nosql {
     ///
     /// # Arguments
     /// * `auth` - Authentication provider
+    /// * `region` - Optional region override
     /// * `service_endpoint` - Optional custom endpoint
     ///
     /// # Example
@@ -59,17 +60,22 @@ impl Nosql {
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ///     let auth = Arc::new(ConfigFileAuth::from_file(None, None)?);
-    ///     let nosql = Nosql::new(auth, None).await?;
+    ///     let nosql = Nosql::new(auth, None, None).await?;
     ///     Ok(())
     /// }
     /// ```
     pub async fn new(
         auth: Arc<dyn AuthProvider>,
-        service_endpoint: Option<String>,
+        region: Option<&str>,
+        service_endpoint: Option<&str>,
     ) -> Result<Self, AuthError> {
-        let region = auth.get_region().await?;
-        let endpoint = service_endpoint
-            .unwrap_or_else(|| format!("https://nosql.{}.oci.oraclecloud.com", region));
+        let endpoint = resolve_endpoint(
+            auth.as_ref(),
+            "https://nosql.{region}.oci.oraclecloud.com",
+            region,
+            service_endpoint,
+        )
+        .await?;
 
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))

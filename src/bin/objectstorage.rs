@@ -572,19 +572,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         AuthMode::Config => {
             let auth = ConfigFileAuth::from_file(None, Some(cli.profile))?;
             let client =
-                ObjectStorageClient::new(auth, cli.namespace, cli.region.as_deref()).await?;
+                ObjectStorageClient::new(auth, cli.namespace, cli.region.as_deref(), None).await?;
             run_command(client, &cli.bucket, cli.json, cli.command).await
         }
         AuthMode::InstancePrincipal => {
             let auth = InstancePrincipalAuth::new(None);
             let client =
-                ObjectStorageClient::new(auth, cli.namespace, cli.region.as_deref()).await?;
+                ObjectStorageClient::new(auth, cli.namespace, cli.region.as_deref(), None).await?;
             run_command(client, &cli.bucket, cli.json, cli.command).await
         }
         AuthMode::WorkloadIdentity => {
             let auth = OkeWorkloadIdentityAuth::new()?;
             let client =
-                ObjectStorageClient::new(auth, cli.namespace, cli.region.as_deref()).await?;
+                ObjectStorageClient::new(auth, cli.namespace, cli.region.as_deref(), None).await?;
             run_command(client, &cli.bucket, cli.json, cli.command).await
         }
     };

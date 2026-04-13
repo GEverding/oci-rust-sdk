@@ -198,17 +198,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.auth {
         AuthMode::Config => {
             let auth = ConfigFileAuth::from_file(None, Some(cli.profile))?;
-            let client = DataFlowClient::new(auth, &cli.region);
+            let client = DataFlowClient::new(auth, Some(&cli.region), None).await?;
             run_command(client, cli.command).await
         }
         AuthMode::InstancePrincipal => {
             let auth = InstancePrincipalAuth::new(None);
-            let client = DataFlowClient::new(auth, &cli.region);
+            let client = DataFlowClient::new(auth, Some(&cli.region), None).await?;
             run_command(client, cli.command).await
         }
         AuthMode::WorkloadIdentity => {
             let auth = OkeWorkloadIdentityAuth::new()?;
-            let client = DataFlowClient::new(auth, &cli.region);
+            let client = DataFlowClient::new(auth, Some(&cli.region), None).await?;
             run_command(client, cli.command).await
         }
     }

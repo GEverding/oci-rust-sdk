@@ -23,7 +23,7 @@
 //!     let auth = Arc::new(ConfigFileAuth::from_file(None, None)?);
 //!
 //!     // Create Identity client
-//!     let identity = Identity::new(auth, None).await?;
+//!     let identity = Identity::new(auth, None, None).await?;
 //!
 //!     // Use the client
 //!     let user = identity.get_current_user().await?;
@@ -60,7 +60,8 @@ pub mod secrets;
 
 // Re-export commonly used types
 pub use auth::{
-    AuthError, AuthProvider, ConfigFileAuth, InstancePrincipalAuth, OkeWorkloadIdentityAuth,
+    resolve_endpoint, AuthError, AuthProvider, ConfigFileAuth, InstancePrincipalAuth,
+    OkeWorkloadIdentityAuth,
 };
 pub use dataflow::{
     CreateRunDetails, DataFlowClient, DataFlowError, ListRunsParams, Run, RunLifecycleState,
