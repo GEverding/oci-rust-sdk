@@ -87,21 +87,151 @@ pub fn encode_body(body: &str) -> String {
     BASE64.encode(result)
 }
 
-/// Try to extract `exp` claim from a JWT security token.
-/// Returns `None` if the token isn't a valid JWT or doesn't contain an `exp` claim.
-fn parse_jwt_expiry(token: &str) -> Option<SystemTime> {
+/// Validates that a K8s service account token has not expired.
+/// Decodes the JWT payload without signature verification, checks the exp claim.
+fn validate_sa_token(token: &str) -> Result<(), AuthError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
-        return None;
+        return Err(AuthError::MetadataError(
+            "SA token is not a valid JWT (expected 3 parts)".into(),
+        ));
     }
-    // JWT uses URL-safe base64 no-pad, but OCI sometimes uses standard — try both
     let payload = BASE64_URL
         .decode(parts[1])
         .or_else(|_| BASE64.decode(parts[1]))
-        .ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-    let exp = claims["exp"].as_u64()?;
-    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(exp))
+        .map_err(|e| {
+            AuthError::MetadataError(format!("Failed to decode SA token payload: {}", e))
+        })?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload)
+        .map_err(|e| AuthError::MetadataError(format!("Failed to parse SA token claims: {}", e)))?;
+    let exp = claims["exp"]
+        .as_u64()
+        .ok_or_else(|| AuthError::MetadataError("SA token has no 'exp' claim".into()))?;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    if now >= exp {
+        return Err(AuthError::MetadataError(format!(
+            "K8s service account token has expired (exp: {}, now: {}). The kubelet may not be refreshing projected tokens.", exp, now
+        )));
+    }
+    Ok(())
+}
+
+/// Parse JWT to extract both issued_at (iat) and expiry (exp) times.
+fn parse_jwt_times(token: &str) -> Result<(SystemTime, SystemTime), AuthError> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(AuthError::MetadataError("Invalid JWT format".into()));
+    }
+    let payload = BASE64_URL
+        .decode(parts[1])
+        .or_else(|_| BASE64.decode(parts[1]))
+        .map_err(|e| AuthError::MetadataError(format!("Failed to decode JWT: {}", e)))?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload)
+        .map_err(|e| AuthError::MetadataError(format!("Failed to parse JWT: {}", e)))?;
+    let exp = claims["exp"]
+        .as_u64()
+        .ok_or_else(|| AuthError::MetadataError("JWT missing 'exp' claim".into()))?;
+    let iat = claims["iat"]
+        .as_u64()
+        .unwrap_or_else(|| exp.saturating_sub(3600)); // default: assume 1h token
+    Ok((
+        SystemTime::UNIX_EPOCH + Duration::from_secs(iat),
+        SystemTime::UNIX_EPOCH + Duration::from_secs(exp),
+    ))
+}
+
+/// Extract public key from RsaKeyPair in PEM format (SPKI/X.509 format)
+fn keypair_to_public_pem(key_pair: &RsaKeyPair) -> Result<String, AuthError> {
+    // aws_lc_rs returns PKCS#1 RSAPublicKey format (modulus + exponent)
+    // but OCI expects SubjectPublicKeyInfo (SPKI) format
+    let pkcs1_der = key_pair.public_key().as_ref();
+
+    // Wrap PKCS#1 in SPKI structure:
+    // SEQUENCE {
+    //   SEQUENCE {
+    //     OBJECT IDENTIFIER rsaEncryption (1.2.840.113549.1.1.1)
+    //     NULL
+    //   }
+    //   BIT STRING { <pkcs1_der> }
+    // }
+
+    // AlgorithmIdentifier for RSA: SEQUENCE { OID, NULL }
+    // OID 1.2.840.113549.1.1.1 = rsaEncryption
+    let algorithm_identifier: &[u8] = &[
+        0x30, 0x0D, // SEQUENCE, length 13
+        0x06, 0x09, // OBJECT IDENTIFIER, length 9
+        0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01, // 1.2.840.113549.1.1.1
+        0x05, 0x00, // NULL
+    ];
+
+    // BIT STRING wrapper for the public key
+    // BIT STRING tag (0x03) + length + unused bits (0x00) + pkcs1_der
+    let bit_string_len = 1 + pkcs1_der.len(); // 1 byte for unused bits + key data
+    let mut bit_string = Vec::with_capacity(3 + bit_string_len);
+    bit_string.push(0x03); // BIT STRING tag
+
+    // Encode length
+    if bit_string_len < 128 {
+        bit_string.push(bit_string_len as u8);
+    } else {
+        // Long form: 0x82 means "length encoded in next 2 bytes"
+        bit_string.push(0x82);
+        bit_string.push((bit_string_len >> 8) as u8);
+        bit_string.push((bit_string_len & 0xFF) as u8);
+    }
+
+    bit_string.push(0x00); // No unused bits
+    bit_string.extend_from_slice(pkcs1_der);
+
+    // Build the outer SEQUENCE
+    let content_len = algorithm_identifier.len() + bit_string.len();
+    let mut spki_der = Vec::with_capacity(4 + content_len);
+    spki_der.push(0x30); // SEQUENCE tag
+
+    // Encode length (will be > 127, so use long form)
+    spki_der.push(0x82); // Long form, 2 bytes follow
+    spki_der.push((content_len >> 8) as u8);
+    spki_der.push((content_len & 0xFF) as u8);
+
+    spki_der.extend_from_slice(algorithm_identifier);
+    spki_der.extend_from_slice(&bit_string);
+
+    // Encode as PEM
+    let pem_obj = ::pem::Pem::new("PUBLIC KEY", spki_der);
+    Ok(::pem::encode(&pem_obj))
+}
+
+/// Sanitize PEM by removing headers/footers and newlines for base64 encoding
+fn sanitize_pem(pem_str: &str) -> String {
+    pem_str
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Generates an OCI opc-request-id: <32hex>/<32hex>/<32hex>
+fn generate_opc_request_id() -> String {
+    use aws_lc_rs::rand::SecureRandom;
+    use aws_lc_rs::rand::SystemRandom;
+    use std::fmt::Write;
+    let rng = SystemRandom::new();
+    let mut id = String::with_capacity(98);
+    for segment in 0..3 {
+        if segment > 0 {
+            id.push('/');
+        }
+        let mut bytes = [0u8; 16];
+        rng.fill(&mut bytes)
+            .expect("failed to generate random bytes");
+        for byte in bytes {
+            write!(id, "{:02x}", byte).expect("hex write failed");
+        }
+    }
+    id
 }
 
 /// Build the signing string and sign it with the provided key pair
@@ -512,6 +642,7 @@ impl AuthProvider for ConfigFileAuth {
 struct InstanceCredentials {
     security_token: String,
     session_key_pair: RsaKeyPair, // Session key pair for signing API requests
+    issued_at: SystemTime,
     expires_at: SystemTime,
 }
 
@@ -520,6 +651,7 @@ impl std::fmt::Debug for InstanceCredentials {
         f.debug_struct("InstanceCredentials")
             .field("security_token", &"[REDACTED]")
             .field("private_key", &"[REDACTED]")
+            .field("issued_at", &self.issued_at)
             .field("expires_at", &self.expires_at)
             .finish()
     }
@@ -562,7 +694,6 @@ pub struct InstancePrincipalAuth {
     tenancy_id: Arc<RwLock<Option<String>>>,
     metadata_base_url: String,
     federation_endpoint: Option<String>,
-    refresh_buffer_secs: u64,
     refresh_lock: Arc<Mutex<()>>, // prevents thundering herd on IMDS
 }
 
@@ -583,7 +714,6 @@ impl InstancePrincipalAuth {
             tenancy_id: Arc::new(RwLock::new(None)),
             metadata_base_url: "http://169.254.169.254/opc/v2".to_string(),
             federation_endpoint: None,
-            refresh_buffer_secs: 300, // 5 minutes before expiry
             refresh_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -798,11 +928,11 @@ impl InstancePrincipalAuth {
 
         // Generate a NEW session key pair for signing subsequent API requests
         let session_key_pair = Self::generate_session_keypair()?;
-        let session_public_pem = Self::keypair_to_public_pem(&session_key_pair)?;
+        let session_public_pem = keypair_to_public_pem(&session_key_pair)?;
 
         // Sanitize PEM strings for base64 encoding
-        let cert_sanitized = Self::sanitize_pem(cert);
-        let session_public_sanitized = Self::sanitize_pem(&session_public_pem);
+        let cert_sanitized = sanitize_pem(cert);
+        let session_public_sanitized = sanitize_pem(&session_public_pem);
 
         // Create the X509 federation request body
         let body = serde_json::json!({
@@ -811,7 +941,7 @@ impl InstancePrincipalAuth {
             "intermediateCertificates": if intermediate_cert.is_empty() {
                 Vec::<String>::new()
             } else {
-                vec![Self::sanitize_pem(intermediate_cert)]
+                vec![sanitize_pem(intermediate_cert)]
             },
             "purpose": "DEFAULT"
         });
@@ -977,76 +1107,6 @@ impl InstancePrincipalAuth {
         })
     }
 
-    /// Extract public key from RsaKeyPair in PEM format (SPKI/X.509 format)
-    fn keypair_to_public_pem(key_pair: &RsaKeyPair) -> Result<String, AuthError> {
-        // aws_lc_rs returns PKCS#1 RSAPublicKey format (modulus + exponent)
-        // but OCI expects SubjectPublicKeyInfo (SPKI) format
-        let pkcs1_der = key_pair.public_key().as_ref();
-
-        // Wrap PKCS#1 in SPKI structure:
-        // SEQUENCE {
-        //   SEQUENCE {
-        //     OBJECT IDENTIFIER rsaEncryption (1.2.840.113549.1.1.1)
-        //     NULL
-        //   }
-        //   BIT STRING { <pkcs1_der> }
-        // }
-
-        // AlgorithmIdentifier for RSA: SEQUENCE { OID, NULL }
-        // OID 1.2.840.113549.1.1.1 = rsaEncryption
-        let algorithm_identifier: &[u8] = &[
-            0x30, 0x0D, // SEQUENCE, length 13
-            0x06, 0x09, // OBJECT IDENTIFIER, length 9
-            0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01, // 1.2.840.113549.1.1.1
-            0x05, 0x00, // NULL
-        ];
-
-        // BIT STRING wrapper for the public key
-        // BIT STRING tag (0x03) + length + unused bits (0x00) + pkcs1_der
-        let bit_string_len = 1 + pkcs1_der.len(); // 1 byte for unused bits + key data
-        let mut bit_string = Vec::with_capacity(3 + bit_string_len);
-        bit_string.push(0x03); // BIT STRING tag
-
-        // Encode length
-        if bit_string_len < 128 {
-            bit_string.push(bit_string_len as u8);
-        } else {
-            // Long form: 0x82 means "length encoded in next 2 bytes"
-            bit_string.push(0x82);
-            bit_string.push((bit_string_len >> 8) as u8);
-            bit_string.push((bit_string_len & 0xFF) as u8);
-        }
-
-        bit_string.push(0x00); // No unused bits
-        bit_string.extend_from_slice(pkcs1_der);
-
-        // Build the outer SEQUENCE
-        let content_len = algorithm_identifier.len() + bit_string.len();
-        let mut spki_der = Vec::with_capacity(4 + content_len);
-        spki_der.push(0x30); // SEQUENCE tag
-
-        // Encode length (will be > 127, so use long form)
-        spki_der.push(0x82); // Long form, 2 bytes follow
-        spki_der.push((content_len >> 8) as u8);
-        spki_der.push((content_len & 0xFF) as u8);
-
-        spki_der.extend_from_slice(algorithm_identifier);
-        spki_der.extend_from_slice(&bit_string);
-
-        // Encode as PEM
-        let pem_obj = ::pem::Pem::new("PUBLIC KEY", spki_der);
-        Ok(::pem::encode(&pem_obj))
-    }
-
-    /// Sanitize PEM by removing headers/footers and newlines for base64 encoding
-    fn sanitize_pem(pem_str: &str) -> String {
-        pem_str
-            .lines()
-            .filter(|line| !line.starts_with("-----"))
-            .collect::<Vec<_>>()
-            .join("")
-    }
-
     /// Refresh credentials from IMDS
     async fn refresh_credentials(&self) -> Result<(), AuthError> {
         // Fetch certificate and key from IMDS
@@ -1065,10 +1125,11 @@ impl InstancePrincipalAuth {
             .fetch_security_token(&cert, &intermediate_cert, &leaf_key_pair)
             .await?;
 
-        // Parse JWT to get actual expiry — tokens may be shorter than 1 hour
-        let expires_at = parse_jwt_expiry(&security_token).unwrap_or_else(|| {
-            warn!("Could not parse JWT exp claim from security token, assuming 1 hour TTL");
-            SystemTime::now() + Duration::from_secs(3600)
+        // Parse JWT to get issued_at and expiry times
+        let (issued_at, expires_at) = parse_jwt_times(&security_token).unwrap_or_else(|_| {
+            warn!("Could not parse JWT iat/exp claims from security token, assuming 1 hour TTL");
+            let now = SystemTime::now();
+            (now, now + Duration::from_secs(3600))
         });
 
         if let Ok(duration) = expires_at.duration_since(SystemTime::now()) {
@@ -1083,21 +1144,30 @@ impl InstancePrincipalAuth {
         *self.credentials.write().await = Some(InstanceCredentials {
             security_token,
             session_key_pair,
+            issued_at,
             expires_at,
         });
 
         Ok(())
     }
 
-    /// Get valid credentials, refreshing if needed
+    /// Get valid credentials, refreshing at half-life
     async fn get_credentials(&self) -> Result<(), AuthError> {
         // Fast path: check if credentials are still valid
         {
             let guard = self.credentials.read().await;
             if let Some(ref creds) = *guard {
-                let buffer = Duration::from_secs(self.refresh_buffer_secs);
-                if creds.expires_at > SystemTime::now() + buffer {
-                    return Ok(());
+                let total_lifetime = creds
+                    .expires_at
+                    .duration_since(creds.issued_at)
+                    .unwrap_or(Duration::from_secs(3600));
+                let half_life = total_lifetime / 2;
+                let time_until_expiry = creds
+                    .expires_at
+                    .duration_since(SystemTime::now())
+                    .unwrap_or(Duration::ZERO);
+                if time_until_expiry > half_life {
+                    return Ok(()); // cache hit — still in first half of lifetime
                 }
             }
         }
@@ -1109,9 +1179,17 @@ impl InstancePrincipalAuth {
         {
             let guard = self.credentials.read().await;
             if let Some(ref creds) = *guard {
-                let buffer = Duration::from_secs(self.refresh_buffer_secs);
-                if creds.expires_at > SystemTime::now() + buffer {
-                    return Ok(());
+                let total_lifetime = creds
+                    .expires_at
+                    .duration_since(creds.issued_at)
+                    .unwrap_or(Duration::from_secs(3600));
+                let half_life = total_lifetime / 2;
+                let time_until_expiry = creds
+                    .expires_at
+                    .duration_since(SystemTime::now())
+                    .unwrap_or(Duration::ZERO);
+                if time_until_expiry > half_life {
+                    return Ok(()); // cache hit — still in first half of lifetime
                 }
             }
         }
@@ -1172,6 +1250,7 @@ impl AuthProvider for InstancePrincipalAuth {
         let creds = guard.as_ref().ok_or(AuthError::TokenExpired)?;
 
         // For Instance Principal, the key ID format is: ST$<security_token>
+        // Token is stored without ST$ prefix, always add it when signing
         let key_id = format!("ST${}", creds.security_token);
 
         // Sign with the SESSION key pair (not the leaf cert key)
@@ -1250,6 +1329,9 @@ impl OkeWorkloadIdentityAuth {
     const PROXYMUX_PORT: u16 = 12250;
     const PROXYMUX_PATH: &'static str = "/resourcePrincipalSessionTokens";
     const IMDS_BASE_URL: &'static str = "http://169.254.169.254/opc/v2";
+    const PROXYMUX_MAX_RETRIES: u32 = 5;
+    const PROXYMUX_INITIAL_BACKOFF_MS: u64 = 250;
+    const PROXYMUX_MAX_BACKOFF_MS: u64 = 5000;
 
     /// Create from environment variables
     pub fn new() -> Result<Self, AuthError> {
@@ -1261,70 +1343,11 @@ impl OkeWorkloadIdentityAuth {
         OkeWorkloadIdentityAuthBuilder::default()
     }
 
-    /// Sanitize public key PEM - remove headers/footers and newlines
-    fn sanitize_public_key(pem: &str) -> String {
-        pem.lines()
-            .filter(|line| !line.starts_with("-----"))
-            .collect::<Vec<_>>()
-            .join("")
-    }
-
     /// Generate RSA 2048 session keypair
     fn generate_session_keypair() -> Result<RsaKeyPair, AuthError> {
         RsaKeyPair::generate(KeySize::Rsa2048).map_err(|e| {
             AuthError::InvalidKeyFormat(format!("Failed to generate keypair: {:?}", e))
         })
-    }
-
-    /// Extract public key from keypair as PEM (SPKI format)
-    fn extract_public_key_pem(key_pair: &RsaKeyPair) -> Result<String, AuthError> {
-        let pkcs1_der = key_pair.public_key().as_ref();
-
-        // Wrap PKCS#1 in SPKI structure
-        let spki_der = {
-            let mut spki = Vec::new();
-
-            // SEQUENCE tag + length placeholder
-            spki.push(0x30);
-            let len_pos = spki.len();
-            spki.push(0x00); // placeholder
-
-            // AlgorithmIdentifier SEQUENCE
-            spki.extend_from_slice(&[
-                0x30, 0x0d, // SEQUENCE, length 13
-                0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01,
-                0x01, // OID rsaEncryption
-                0x05, 0x00, // NULL
-            ]);
-
-            // BIT STRING containing PKCS#1 public key
-            spki.push(0x03); // BIT STRING tag
-            let bit_string_len = pkcs1_der.len() + 1;
-            if bit_string_len < 128 {
-                spki.push(bit_string_len as u8);
-            } else {
-                spki.push(0x82);
-                spki.push((bit_string_len >> 8) as u8);
-                spki.push((bit_string_len & 0xff) as u8);
-            }
-            spki.push(0x00); // no unused bits
-            spki.extend_from_slice(pkcs1_der);
-
-            // Fix outer SEQUENCE length
-            let total_len = spki.len() - 2;
-            if total_len < 128 {
-                spki[len_pos] = total_len as u8;
-            } else {
-                spki.insert(len_pos, 0x82);
-                spki.insert(len_pos + 1, (total_len >> 8) as u8);
-                spki.insert(len_pos + 2, (total_len & 0xff) as u8);
-            }
-
-            spki
-        };
-
-        let pem = ::pem::Pem::new("PUBLIC KEY", spki_der);
-        Ok(::pem::encode(&pem))
     }
 
     /// Read K8s service account token
@@ -1355,10 +1378,14 @@ impl OkeWorkloadIdentityAuth {
     async fn fetch_session_token(&self) -> Result<InstanceCredentials, AuthError> {
         debug!("Starting session token fetch from proxymux");
 
+        // Read and validate SA token BEFORE making the request
         let sa_token = self.read_sa_token()?;
+        validate_sa_token(&sa_token)?;
+
+        // Generate session keypair and prepare request body
         let session_key_pair = Self::generate_session_keypair()?;
-        let public_key_pem = Self::extract_public_key_pem(&session_key_pair)?;
-        let sanitized_key = Self::sanitize_public_key(&public_key_pem);
+        let public_key_pem = keypair_to_public_pem(&session_key_pair)?;
+        let sanitized_key = sanitize_pem(&public_key_pem);
 
         let url = format!(
             "https://{}:{}{}",
@@ -1367,84 +1394,111 @@ impl OkeWorkloadIdentityAuth {
             Self::PROXYMUX_PATH
         );
 
-        debug!(
-            url = %url,
-            service_host = %self.service_host,
-            service_port = %self.service_port,
-            "Calling proxymux endpoint"
-        );
-
         let body = serde_json::json!({
             "podKey": sanitized_key
         });
 
-        let response = self
-            .http_client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", sa_token))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+        // Generate opc-request-id for tracing
+        let opc_request_id = generate_opc_request_id();
+        tracing::debug!(opc_request_id = %opc_request_id, "Requesting session token from proxymux");
 
-        let status = response.status();
-        debug!(status = %status, "Received response from proxymux");
+        // Retry loop for proxymux requests
+        let mut last_error = None;
+        for attempt in 0..=Self::PROXYMUX_MAX_RETRIES {
+            if attempt > 0 {
+                let backoff = std::cmp::min(
+                    Self::PROXYMUX_INITIAL_BACKOFF_MS * 2u64.pow(attempt - 1),
+                    Self::PROXYMUX_MAX_BACKOFF_MS,
+                );
+                tracing::warn!(attempt, backoff_ms = backoff, error = ?last_error, "Retrying proxymux token request");
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
+            }
 
-        if !status.is_success() {
-            let headers = response.headers().clone();
-            let body = response.text().await.unwrap_or_default();
+            let result = self
+                .http_client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", sa_token))
+                .header("Content-Type", "application/json")
+                .header("opc-request-id", &opc_request_id)
+                .json(&body)
+                .send()
+                .await;
 
-            warn!(
-                status = %status,
-                status_code = status.as_u16(),
-                body = %body,
-                headers = ?headers,
-                url = %url,
-                service_host = %self.service_host,
-                service_port = %self.service_port,
-                "Proxymux request failed"
-            );
+            match result {
+                Err(e) => {
+                    last_error = Some(AuthError::MetadataError(format!(
+                        "Proxymux request failed: {}",
+                        e
+                    )));
+                    continue; // connection/timeout error, retry
+                }
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        // Response is base64-encoded JSON
+                        let response_text = response.text().await?;
+                        debug!(
+                            response_len = response_text.len(),
+                            "Received base64-encoded response"
+                        );
 
-            return Err(AuthError::MetadataError(format!(
-                "Proxymux request failed: {} - {}",
-                status, body
-            )));
+                        let decoded = BASE64.decode(response_text.as_bytes()).map_err(|e| {
+                            error!(error = %e, "Failed to decode base64 response");
+                            AuthError::InvalidKeyFormat(format!("Failed to decode response: {}", e))
+                        })?;
+
+                        let proxymux_response: ProxymuxResponse = serde_json::from_slice(&decoded)?;
+
+                        // Strip ST$ prefix if present, store without it
+                        let raw_token = proxymux_response.token;
+                        let token = if let Some(stripped) = raw_token.strip_prefix("ST$") {
+                            stripped.to_string()
+                        } else {
+                            raw_token
+                        };
+
+                        // Parse JWT to get issued_at and expiry times
+                        let (issued_at, expires_at) = parse_jwt_times(&token)?;
+
+                        if let Ok(duration) = expires_at.duration_since(SystemTime::now()) {
+                            info!(
+                                expires_in_secs = duration.as_secs(),
+                                "Successfully fetched session token"
+                            );
+                        } else {
+                            warn!("Token already expired");
+                        }
+
+                        return Ok(InstanceCredentials {
+                            security_token: token,
+                            session_key_pair,
+                            issued_at,
+                            expires_at,
+                        });
+                    } else if status.as_u16() == 403 {
+                        return Err(AuthError::MetadataError("Proxymux returned 403. Please ensure the cluster type is enhanced (OKE).".into()));
+                    } else if status.is_client_error() {
+                        let body = response.text().await.unwrap_or_default();
+                        return Err(AuthError::MetadataError(format!(
+                            "Proxymux request failed: {} - {}",
+                            status, body
+                        )));
+                    } else {
+                        // 5xx, retry
+                        let body = response.text().await.unwrap_or_default();
+                        last_error = Some(AuthError::MetadataError(format!(
+                            "Proxymux request failed: {} - {}",
+                            status, body
+                        )));
+                        continue;
+                    }
+                }
+            }
         }
-
-        // Response is base64-encoded JSON
-        let response_text = response.text().await?;
-        debug!(
-            response_len = response_text.len(),
-            "Received base64-encoded response"
-        );
-
-        let decoded = BASE64.decode(response_text.as_bytes()).map_err(|e| {
-            error!(error = %e, "Failed to decode base64 response");
-            AuthError::InvalidKeyFormat(format!("Failed to decode response: {}", e))
-        })?;
-
-        let proxymux_response: ProxymuxResponse = serde_json::from_slice(&decoded)?;
-
-        // Parse JWT to get expiry
-        let expires_at = parse_jwt_expiry(&proxymux_response.token).ok_or_else(|| {
-            error!("Failed to parse JWT exp claim from proxymux token");
-            AuthError::InvalidKeyFormat("No exp claim in token".to_string())
-        })?;
-
-        if let Ok(duration) = expires_at.duration_since(SystemTime::now()) {
-            info!(
-                expires_in_secs = duration.as_secs(),
-                "Successfully fetched session token"
-            );
-        } else {
-            warn!("Token already expired");
-        }
-
-        Ok(InstanceCredentials {
-            security_token: proxymux_response.token,
-            session_key_pair,
-            expires_at,
-        })
+        // If we get here, all retries exhausted
+        Err(last_error.unwrap_or_else(|| {
+            AuthError::MetadataError("Proxymux request failed after all retries".into())
+        }))
     }
 
     /// Get valid credentials, refreshing at half-life
@@ -1453,26 +1507,28 @@ impl OkeWorkloadIdentityAuth {
         {
             let guard = self.credentials.read().await;
             if let Some(ref creds) = *guard {
-                // Refresh at half-life: check if we're past the halfway point to expiry
-                let now = SystemTime::now();
-                if let Ok(time_until_expiry) = creds.expires_at.duration_since(now) {
-                    // Token is still valid, check if we're in the first half of its lifetime
-                    // We need to know when it was issued to calculate half-life
-                    // For simplicity, assume tokens are valid for 1 hour and refresh at 30 min remaining
-                    if time_until_expiry > Duration::from_secs(1800) {
-                        debug!(
-                            time_until_expiry_secs = time_until_expiry.as_secs(),
-                            "Credentials cache hit - token still valid"
-                        );
-                        return Ok(());
-                    } else {
-                        debug!(
-                            time_until_expiry_secs = time_until_expiry.as_secs(),
-                            "Credentials need refresh - approaching expiry"
-                        );
-                    }
+                let total_lifetime = creds
+                    .expires_at
+                    .duration_since(creds.issued_at)
+                    .unwrap_or(Duration::from_secs(3600));
+                let half_life = total_lifetime / 2;
+                let time_until_expiry = creds
+                    .expires_at
+                    .duration_since(SystemTime::now())
+                    .unwrap_or(Duration::ZERO);
+                if time_until_expiry > half_life {
+                    debug!(
+                        time_until_expiry_secs = time_until_expiry.as_secs(),
+                        half_life_secs = half_life.as_secs(),
+                        "Credentials cache hit - token still in first half of lifetime"
+                    );
+                    return Ok(()); // cache hit — still in first half of lifetime
                 } else {
-                    warn!("Token expired, refreshing");
+                    debug!(
+                        time_until_expiry_secs = time_until_expiry.as_secs(),
+                        half_life_secs = half_life.as_secs(),
+                        "Credentials need refresh - past half-life"
+                    );
                 }
             } else {
                 debug!("No cached credentials, fetching new token");
@@ -1523,12 +1579,9 @@ impl AuthProvider for OkeWorkloadIdentityAuth {
         let guard = self.credentials.read().await;
         let creds = guard.as_ref().ok_or(AuthError::TokenExpired)?;
 
-        // Key ID is ST${token} (full token including ST$ prefix if present)
-        let key_id = if creds.security_token.starts_with("ST$") {
-            creds.security_token.clone()
-        } else {
-            format!("ST${}", creds.security_token)
-        };
+        // Key ID is ST${token}
+        // Token is stored without ST$ prefix, always add it when signing
+        let key_id = format!("ST${}", creds.security_token);
 
         let authorization = sign_request_with_key(
             &creds.session_key_pair,
@@ -1677,7 +1730,8 @@ impl OkeWorkloadIdentityAuthBuilder {
 
         let http_client = reqwest::Client::builder()
             .add_root_certificate(ca_cert)
-            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
             .build()
             .map_err(|e| AuthError::ConfigError(format!("Failed to build HTTP client: {}", e)))?;
 
