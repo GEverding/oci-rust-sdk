@@ -1299,6 +1299,54 @@ struct ProxymuxResponse {
     token: String,
 }
 
+/// Parse strategy result for debug logging
+#[derive(Debug)]
+enum ParseStrategy {
+    QuotedBase64,
+    RawBase64,
+    DirectJson,
+}
+
+/// Parse proxymux response body, supporting multiple wire formats:
+/// 1. Quoted base64: `"<base64>"` → unquote → base64-decode → parse JSON
+/// 2. Raw base64: `<base64>` → base64-decode → parse JSON
+/// 3. Direct JSON: `{"token": "..."}` → parse JSON directly
+///
+/// Returns (ProxymuxResponse, ParseStrategy) on success.
+fn parse_proxymux_response(body: &str) -> Result<(ProxymuxResponse, ParseStrategy), AuthError> {
+    let trimmed = body.trim();
+
+    // Strategy 1: Quoted base64
+    if trimmed.starts_with('"') && trimmed.ends_with('"') {
+        let unquoted = &trimmed[1..trimmed.len() - 1];
+        if let Ok(decoded) = BASE64.decode(unquoted.as_bytes()) {
+            if let Ok(response) = serde_json::from_slice::<ProxymuxResponse>(&decoded) {
+                return Ok((response, ParseStrategy::QuotedBase64));
+            }
+        }
+    }
+
+    // Strategy 2: Raw base64
+    if !trimmed.starts_with('{') {
+        if let Ok(decoded) = BASE64.decode(trimmed.as_bytes()) {
+            if let Ok(response) = serde_json::from_slice::<ProxymuxResponse>(&decoded) {
+                return Ok((response, ParseStrategy::RawBase64));
+            }
+        }
+    }
+
+    // Strategy 3: Direct JSON
+    if trimmed.starts_with('{') {
+        if let Ok(response) = serde_json::from_str::<ProxymuxResponse>(trimmed) {
+            return Ok((response, ParseStrategy::DirectJson));
+        }
+    }
+
+    Err(AuthError::InvalidKeyFormat(
+        "Failed to parse proxymux response: tried quoted_base64, raw_base64, and direct_json strategies".to_string()
+    ))
+}
+
 /// Authentication for workloads running in Oracle Kubernetes Engine (OKE)
 ///
 /// Uses the in-cluster proxymux service to exchange K8s service account tokens
@@ -1435,19 +1483,32 @@ impl OkeWorkloadIdentityAuth {
                 Ok(response) => {
                     let status = response.status();
                     if status.is_success() {
-                        // Response is base64-encoded JSON
                         let response_text = response.text().await?;
+                        let trimmed = response_text.trim();
+
+                        // Log response shape without leaking token
+                        let starts_with = if trimmed.starts_with('"') {
+                            "quote"
+                        } else if trimmed.starts_with('{') {
+                            "brace"
+                        } else {
+                            "other"
+                        };
+
                         debug!(
                             response_len = response_text.len(),
-                            "Received base64-encoded response"
+                            starts_with = %starts_with,
+                            "Received proxymux response"
                         );
 
-                        let decoded = BASE64.decode(response_text.as_bytes()).map_err(|e| {
-                            error!(error = %e, "Failed to decode base64 response");
-                            AuthError::InvalidKeyFormat(format!("Failed to decode response: {}", e))
-                        })?;
+                        // Parse using multi-strategy parser
+                        let (proxymux_response, strategy) =
+                            parse_proxymux_response(&response_text)?;
 
-                        let proxymux_response: ProxymuxResponse = serde_json::from_slice(&decoded)?;
+                        debug!(
+                            strategy = ?strategy,
+                            "Successfully parsed proxymux response"
+                        );
 
                         // Strip ST$ prefix if present, store without it
                         let raw_token = proxymux_response.token;
@@ -2174,5 +2235,108 @@ mod tests {
             result.unwrap(),
             "https://queue.messaging.us-ashburn-1.oci.oraclecloud.com"
         );
+    }
+
+    // =========================================================================
+    // parse_proxymux_response tests
+    // =========================================================================
+
+    #[test]
+    fn test_parse_proxymux_response_quoted_base64() {
+        // Simulate Go SDK behavior: quoted base64 string
+        let json_payload = r#"{"token":"ST$test.token.here"}"#;
+        let base64_encoded = BASE64.encode(json_payload.as_bytes());
+        let quoted = format!("\"{}\"", base64_encoded);
+
+        let result = parse_proxymux_response(&quoted);
+        assert!(result.is_ok(), "Should parse quoted base64");
+        let (response, strategy) = result.unwrap();
+        assert_eq!(response.token, "ST$test.token.here");
+        assert!(matches!(strategy, ParseStrategy::QuotedBase64));
+    }
+
+    #[test]
+    fn test_parse_proxymux_response_raw_base64() {
+        // Raw base64 without quotes
+        let json_payload = r#"{"token":"ST$test.token.here"}"#;
+        let base64_encoded = BASE64.encode(json_payload.as_bytes());
+
+        let result = parse_proxymux_response(&base64_encoded);
+        assert!(result.is_ok(), "Should parse raw base64");
+        let (response, strategy) = result.unwrap();
+        assert_eq!(response.token, "ST$test.token.here");
+        assert!(matches!(strategy, ParseStrategy::RawBase64));
+    }
+
+    #[test]
+    fn test_parse_proxymux_response_direct_json() {
+        // Direct JSON object
+        let json_payload = r#"{"token":"ST$test.token.here"}"#;
+
+        let result = parse_proxymux_response(json_payload);
+        assert!(result.is_ok(), "Should parse direct JSON");
+        let (response, strategy) = result.unwrap();
+        assert_eq!(response.token, "ST$test.token.here");
+        assert!(matches!(strategy, ParseStrategy::DirectJson));
+    }
+
+    #[test]
+    fn test_parse_proxymux_response_direct_json_with_whitespace() {
+        // Direct JSON with leading/trailing whitespace
+        let json_payload = r#"  {"token":"ST$test.token.here"}  "#;
+
+        let result = parse_proxymux_response(json_payload);
+        assert!(result.is_ok(), "Should parse direct JSON with whitespace");
+        let (response, strategy) = result.unwrap();
+        assert_eq!(response.token, "ST$test.token.here");
+        assert!(matches!(strategy, ParseStrategy::DirectJson));
+    }
+
+    #[test]
+    fn test_parse_proxymux_response_malformed_quoted() {
+        // Quoted but not valid base64
+        let malformed = r#""not-valid-base64!!!""#;
+
+        let result = parse_proxymux_response(malformed);
+        assert!(result.is_err(), "Should fail on malformed quoted string");
+        let err = result.unwrap_err();
+        assert!(matches!(err, AuthError::InvalidKeyFormat(_)));
+    }
+
+    #[test]
+    fn test_parse_proxymux_response_malformed_base64() {
+        // Invalid base64
+        let malformed = "not-valid-base64!!!";
+
+        let result = parse_proxymux_response(malformed);
+        assert!(result.is_err(), "Should fail on malformed base64");
+        let err = result.unwrap_err();
+        assert!(matches!(err, AuthError::InvalidKeyFormat(_)));
+    }
+
+    #[test]
+    fn test_parse_proxymux_response_malformed_json() {
+        // Invalid JSON
+        let malformed = r#"{"token":"missing closing brace"#;
+
+        let result = parse_proxymux_response(malformed);
+        assert!(result.is_err(), "Should fail on malformed JSON");
+        let err = result.unwrap_err();
+        assert!(matches!(err, AuthError::InvalidKeyFormat(_)));
+    }
+
+    #[test]
+    fn test_parse_proxymux_response_empty_string() {
+        let result = parse_proxymux_response("");
+        assert!(result.is_err(), "Should fail on empty string");
+    }
+
+    #[test]
+    fn test_parse_proxymux_response_missing_token_field() {
+        // Valid JSON but missing "token" field
+        let json_payload = r#"{"other":"field"}"#;
+
+        let result = parse_proxymux_response(json_payload);
+        assert!(result.is_err(), "Should fail when token field is missing");
     }
 }
