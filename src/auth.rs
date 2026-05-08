@@ -529,6 +529,55 @@ impl ConfigFileAuth {
         })
     }
 
+    /// Create ConfigFileAuth from explicit PEM key content (no file I/O required)
+    pub fn from_key_content(
+        user: String,
+        key_content: String,
+        fingerprint: String,
+        tenancy: String,
+        region: String,
+        passphrase: Option<String>,
+    ) -> Result<Self, AuthError> {
+        let key_pair = Self::load_private_key(&key_content, passphrase.as_deref())?;
+        Ok(Self {
+            user,
+            fingerprint,
+            tenancy,
+            region,
+            key_pair,
+        })
+    }
+
+    /// Create ConfigFileAuth from environment variables.
+    ///
+    /// `OCI_CLI_KEY_CONTENT` (raw PEM string) takes precedence over `OCI_CLI_KEY_FILE`.
+    /// Required: `OCI_CLI_USER`, `OCI_CLI_FINGERPRINT`, `OCI_CLI_TENANCY`, `OCI_CLI_REGION`,
+    /// and either `OCI_CLI_KEY_CONTENT` or `OCI_CLI_KEY_FILE`.
+    /// Optional: `OCI_CLI_PASSPHRASE`.
+    pub fn from_env() -> Result<Self, AuthError> {
+        let get = |name: &str| {
+            std::env::var(name)
+                .map_err(|_| AuthError::ConfigError(format!("Missing env var: {}", name)))
+        };
+
+        let user = get("OCI_CLI_USER")?;
+        let fingerprint = get("OCI_CLI_FINGERPRINT")?;
+        let tenancy = get("OCI_CLI_TENANCY")?;
+        let region = get("OCI_CLI_REGION")?;
+        let passphrase = std::env::var("OCI_CLI_PASSPHRASE").ok();
+
+        let key_content = if let Ok(content) = std::env::var("OCI_CLI_KEY_CONTENT") {
+            content
+        } else {
+            let key_file = get("OCI_CLI_KEY_FILE")?;
+            std::fs::read_to_string(&key_file).map_err(|e| {
+                AuthError::KeyLoadError(format!("Failed to read key file '{}': {}", key_file, e))
+            })?
+        };
+
+        Self::from_key_content(user, key_content, fingerprint, tenancy, region, passphrase)
+    }
+
     /// Load authentication from OCI config file
     ///
     /// # Arguments
