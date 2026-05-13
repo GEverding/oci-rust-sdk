@@ -63,6 +63,10 @@ fn progress_bar(total: u64) -> ProgressBar {
 #[command(name = "oci-objectstorage")]
 #[command(about = "OCI Object Storage CLI for managing objects")]
 struct Cli {
+    /// Path to OCI config file (only used with --auth=config)
+    #[arg(short = 'c', long, env = "OCI_CLI_CONFIG_FILE")]
+    config: Option<String>,
+
     /// OCI config profile name (only used with --auth=config)
     #[arg(short, long, default_value = "DEFAULT")]
     profile: String,
@@ -570,7 +574,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = match cli.auth {
         AuthMode::Config => {
-            let auth = ConfigFileAuth::from_file(None, Some(cli.profile))?;
+            let auth = ConfigFileAuth::from_file(cli.config, Some(cli.profile))?;
             let client =
                 ObjectStorageClient::new(auth, cli.namespace, cli.region.as_deref(), None).await?;
             run_command(client, &cli.bucket, cli.json, cli.command).await

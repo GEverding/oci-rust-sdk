@@ -781,7 +781,7 @@ impl InstancePrincipalAuth {
 
     async fn get_http_client(&self) -> reqwest::Client {
         reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(180))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     }

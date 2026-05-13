@@ -591,7 +591,7 @@ impl<A: AuthProvider> ObjectStorageClient<A> {
             .pool_max_idle_per_host(64)
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(60))
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(180))
             .build()?;
         Ok(Self {
             auth,

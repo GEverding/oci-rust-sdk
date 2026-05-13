@@ -86,7 +86,7 @@ impl SecretsClient {
         .await?;
 
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(180))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 

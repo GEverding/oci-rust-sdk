@@ -266,7 +266,7 @@ impl QueueClient {
         .await?;
 
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(180))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -285,7 +285,7 @@ impl QueueClient {
         endpoint: String,
     ) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(180))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 

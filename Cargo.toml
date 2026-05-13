@@ -30,7 +30,7 @@ pem = "3.0"
 urlencoding = "2.1"
 bytes = "1"
 tracing = "0.1"
-clap = { version = "4", features = ["derive"], optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
 indicatif = { version = "0.17", optional = true }
 
 [dev-dependencies]

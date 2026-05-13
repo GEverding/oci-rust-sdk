@@ -3,6 +3,7 @@ use chrono::Utc;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -145,9 +146,13 @@ impl<A: AuthProvider> DataFlowClient<A> {
         let url_template = "https://dataflow.{region}.oci.oraclecloud.com/20200129";
         let base_url = resolve_endpoint(&auth, url_template, region, service_endpoint).await?;
 
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(180))
+            .build()?;
+
         Ok(Self {
             auth,
-            client: reqwest::Client::new(),
+            client,
             base_url,
         })
     }
