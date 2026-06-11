@@ -17,13 +17,13 @@ Choose a backend at compile time:
 
 ```toml
 # Default (rustls + ring)
-oci-sdk = "0.4"
+oci-sdk = "0.5"
 
 # rustls + aws-lc
-oci-sdk = { version = "0.4", default-features = false, features = ["tls-rustls-aws-lc"] }
+oci-sdk = { version = "0.5", default-features = false, features = ["tls-rustls-aws-lc"] }
 
 # native-tls
-oci-sdk = { version = "0.4", default-features = false, features = ["tls-native"] }
+oci-sdk = { version = "0.5", default-features = false, features = ["tls-native"] }
 ```
 
 Exactly one TLS feature must be enabled:
@@ -160,9 +160,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         file.write_all(&chunk?).await?;
     }
 
-    // Upload
+    // Upload (no Content-MD5 check)
     let data = tokio::fs::read("local-file.bin").await?;
-    client.put_object("my-bucket", "path/to/object", data.into(), None).await?;
+    client.put_object("my-bucket", "path/to/object", data.into(), None, None).await?;
+
+    // Upload with Content-MD5 integrity check (OCI returns 400 BadDigest on mismatch)
+    use md5::{Digest, Md5};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let data: bytes::Bytes = tokio::fs::read("local-file.bin").await?.into();
+    let md5_b64 = STANDARD.encode(Md5::digest(&data));
+    client.put_object("my-bucket", "path/to/object", data, None, Some(&md5_b64)).await?;
 
     Ok(())
 }
@@ -260,6 +267,24 @@ let client = ObjectStorageClient::with_client(auth, "namespace", None, None, htt
 ```
 
 > **Note:** `put_object` requires the full object body in memory to compute the `x-content-sha256` header required by OCI. For objects larger than ~100MB, multipart upload is recommended (not yet implemented).
+
+## Changelog
+
+### 0.5.0
+
+**BREAKING:** `put_object` gains a `content_md5: Option<&str>` parameter (last position).
+
+Callers that previously wrote:
+```rust
+client.put_object(bucket, name, body, content_type).await?;
+```
+must now write:
+```rust
+client.put_object(bucket, name, body, content_type, None).await?;
+```
+
+When `Some(&md5_b64)` is passed, the value is forwarded as the `Content-MD5` request header.
+OCI validates the digest server-side and returns `400 BadDigest` on mismatch.
 
 ## License
 

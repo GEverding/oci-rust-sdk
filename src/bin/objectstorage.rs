@@ -416,6 +416,7 @@ async fn run_command<A: AuthProvider>(
                         &name,
                         bytes::Bytes::from(data),
                         content_type.as_deref(),
+                        None,
                     )
                     .await?;
                 pb.finish_with_message("done");

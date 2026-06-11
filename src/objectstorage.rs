@@ -568,6 +568,20 @@ impl<A: AuthProvider> std::fmt::Debug for ObjectStorageClient<A> {
     }
 }
 
+/// Build a [`HeaderMap`] containing a `Content-MD5` header when `md5` is `Some`.
+///
+/// Returns `None` when `md5` is `None` (no extra headers needed).
+fn build_content_md5_headers(md5: Option<&str>) -> Result<Option<HeaderMap>, ObjectStorageError> {
+    match md5 {
+        None => Ok(None),
+        Some(value) => {
+            let mut map = HeaderMap::with_capacity(1);
+            map.insert("content-md5", value.parse()?);
+            Ok(Some(map))
+        }
+    }
+}
+
 impl<A: AuthProvider> ObjectStorageClient<A> {
     /// Create a client with a default connection pool.
     ///
@@ -633,7 +647,20 @@ impl<A: AuthProvider> ObjectStorageClient<A> {
         path: &str,
         body: RequestBody,
     ) -> Result<(reqwest::Response, Option<String>), ObjectStorageError> {
-        let (response, opc_request_id) = self.do_signed_request(method, path, &body).await?;
+        self.sign_and_send_inner_with_headers(method, path, body, None)
+            .await
+    }
+
+    async fn sign_and_send_inner_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: RequestBody,
+        extra_headers: Option<HeaderMap>,
+    ) -> Result<(reqwest::Response, Option<String>), ObjectStorageError> {
+        let (response, opc_request_id) = self
+            .do_signed_request(method, path, &body, extra_headers.as_ref())
+            .await?;
         let status = response.status();
 
         // On 401, invalidate credentials and retry once with fresh auth
@@ -645,7 +672,9 @@ impl<A: AuthProvider> ObjectStorageClient<A> {
             // Consume body to free the connection
             let _ = response.text().await;
             self.auth.invalidate_credentials().await;
-            return self.do_signed_request(method, path, &body).await;
+            return self
+                .do_signed_request(method, path, &body, extra_headers.as_ref())
+                .await;
         }
 
         Ok((response, opc_request_id))
@@ -656,6 +685,7 @@ impl<A: AuthProvider> ObjectStorageClient<A> {
         method: &str,
         path: &str,
         body: &RequestBody,
+        extra_headers: Option<&HeaderMap>,
     ) -> Result<(reqwest::Response, Option<String>), ObjectStorageError> {
         let mut headers = HeaderMap::with_capacity(8);
 
@@ -681,6 +711,15 @@ impl<A: AuthProvider> ObjectStorageClient<A> {
             }
             RequestBody::None => None,
         };
+
+        // Insert extra headers (e.g. Content-MD5) before signing so they are
+        // present in the request. The signer ignores unknown headers, so this
+        // is safe and does not affect the signed-headers list.
+        if let Some(extra) = extra_headers {
+            for (name, value) in extra {
+                headers.insert(name, value.clone());
+            }
+        }
 
         self.auth
             .sign_request(&mut headers, method, path, &self.service_endpoint)
@@ -963,12 +1002,17 @@ impl<A: AuthProvider> ObjectStorageClient<A> {
     /// **Note:** The entire `body` must fit in memory because OCI requires an
     /// `x-content-sha256` header computed over the full body before the request is sent.
     /// For objects larger than ~100 MB, use [`ObjectStorageClient::upload_file`] instead.
+    ///
+    /// `content_md5` — when `Some`, the verbatim base64-encoded MD5 digest is sent as the
+    /// `Content-MD5` request header. OCI returns `400 BadDigest` if the value does not match
+    /// the received body. Pass `None` to omit the header.
     pub async fn put_object(
         &self,
         bucket: &str,
         object_name: &str,
         body: bytes::Bytes,
         content_type: Option<&str>,
+        content_md5: Option<&str>,
     ) -> Result<Option<String>, ObjectStorageError> {
         let path = format!(
             "/n/{}/b/{}/o/{}",
@@ -977,8 +1021,14 @@ impl<A: AuthProvider> ObjectStorageClient<A> {
             urlencoding::encode(object_name),
         );
         let ct = content_type.unwrap_or("application/octet-stream");
+        let extra = build_content_md5_headers(content_md5)?;
         let (response, opc_request_id) = self
-            .sign_and_send_inner("put", &path, RequestBody::Bytes(body, ct.to_string()))
+            .sign_and_send_inner_with_headers(
+                "put",
+                &path,
+                RequestBody::Bytes(body, ct.to_string()),
+                extra,
+            )
             .await?;
         // Consume body to ensure connection is returned to pool cleanly
         let _ = response.text().await;
@@ -2187,5 +2237,36 @@ mod tests {
         let n = read_exact_or_eof(&mut reader, &mut buf, 0).await.unwrap();
         assert_eq!(n, 0, "max_bytes=0 should read nothing");
         assert!(buf.is_empty());
+    }
+
+    // ── Content-MD5 header building ──────────────────────────────────────────
+
+    #[test]
+    fn test_build_content_md5_headers_none_returns_none() {
+        let result = build_content_md5_headers(None).unwrap();
+        assert!(result.is_none(), "None md5 should produce no extra headers");
+    }
+
+    #[test]
+    fn test_build_content_md5_headers_some_inserts_header() {
+        let md5_b64 = "rL0Y20zC+Fzt72VPzMSk2A==";
+        let result = build_content_md5_headers(Some(md5_b64)).unwrap();
+        let map = result.expect("Some md5 should produce a HeaderMap");
+        let value = map
+            .get("content-md5")
+            .expect("content-md5 header must be present")
+            .to_str()
+            .unwrap();
+        assert_eq!(value, md5_b64);
+    }
+
+    #[test]
+    fn test_build_content_md5_headers_exact_value_preserved() {
+        // Verify the verbatim base64 string is forwarded unchanged.
+        let md5_b64 = "1B2M2Y8AsgTpgAmY7PhCfg==";
+        let map = build_content_md5_headers(Some(md5_b64)).unwrap().unwrap();
+        assert_eq!(map.get("content-md5").unwrap().to_str().unwrap(), md5_b64);
+        // Only one header should be present.
+        assert_eq!(map.len(), 1);
     }
 }
